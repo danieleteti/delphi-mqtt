@@ -1,0 +1,7 @@
+/nul
+*.dcu
+*.res
+*.local
+__history/
+*.identcache
+/.claude/settings.local.json
