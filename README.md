@@ -295,12 +295,25 @@ Three SSL samples are provided in `samples/10_SSL/`:
 
 ## Logging
 
-The client exposes an `IMQTTLogger` interface so you can plug in any logging backend.
-Two built-in implementations ship in `MQTT.Logger`:
+The client exposes an `IMQTTLogger` interface so the core library stays free
+of any external logging dependency. `MQTT.Logger` ships only two trivial
+implementations:
 
-- `TMQTTConsoleLogger` — thread-safe `Writeln` (console apps only)
-- `TMQTTFileLogger` — thread-safe append-mode UTF-8 file writer
-- `TMQTTNullLogger` — silent default; no overhead when no logger is set
+- `TMQTTNullLogger` — the default. Zero-overhead no-op when no logger is set.
+- `TMQTTProcLogger` — forwards every call to a `reference to procedure`
+  callback. Use it from sample code or quick scripts when you want to see
+  what the client is doing without pulling in a real logger.
+
+For production, plug your existing logging framework via an adapter. A ready
+adapter for **[LoggerPro](https://github.com/danieleteti/loggerpro)**
+(async, multi-appender, thread-safe) ships in
+`src/MQTT.Logger.LoggerPro.pas`. Other frameworks (CodeSiteLogging, log4d,
+your in-house writer) take ~30 lines to wrap — see the LoggerPro adapter as
+a template.
+
+Log levels (lowest to highest): `llDebug`, `llInfo`, `llWarning`, `llError`, `llNone`.
+
+### Quick & dirty: inline procedure logger
 
 ```pascal
 uses MQTT.Client, MQTT.Logger, MQTT.Types;
@@ -310,17 +323,47 @@ var
 begin
   Client := CreateMQTTClient;
 
-  // Console logger at DEBUG level - logs every TX/RX packet
-  Client.Logger := CreateConsoleLogger(llDebug);
-
-  // Or write to a file
-  // Client.Logger := CreateFileLogger('mqtt.log', True, llInfo);
+  Client.Logger := CreateProcLogger(
+    procedure(Level: TMQTTLogLevel; const Msg: string)
+    begin
+      Writeln(Format('[%-5s] %s', [LogLevelName(Level), Msg]));
+    end,
+    llDebug);
 
   Client.Connect('localhost', 1883);
 end;
 ```
 
-Log levels (lowest to highest): `llDebug`, `llInfo`, `llWarning`, `llError`, `llNone`.
+### Production: LoggerPro adapter
+
+```pascal
+uses
+  LoggerPro, LoggerPro.ConsoleAppender, LoggerPro.FileAppender,
+  MQTT.Client, MQTT.Logger, MQTT.Logger.LoggerPro, MQTT.Types;
+
+var
+  Log: ILogWriter;
+  Client: IMQTTClient;
+begin
+  Log := BuildLogWriter([
+    TLoggerProConsoleAppender.Create,
+    TLoggerProFileAppender.Create(5, 1000, 'logs')   // 5 backups, 1 MB each
+  ]);
+
+  Client := CreateMQTTClient;
+  Client.Logger := WrapLoggerPro(Log, 'MQTT', llDebug);
+
+  Client.Connect('localhost', 1883);
+end;
+```
+
+The adapter tags every entry (default `'MQTT'`) so file/console formatters can
+split MQTT traffic from the rest of your app. See
+`samples/13_LoggerPro/` for a runnable example.
+
+> **Note**: `MQTT.Logger.LoggerPro.pas` is optional. Add it to your project
+> only when you want LoggerPro to receive the client's log messages — the
+> core unit `MQTT.Client` never links against LoggerPro.
 
 ## Packet Monitoring
 
@@ -545,10 +588,11 @@ DelayInterval: Cardinal;      // MQTT 5.0 will delay
 ```
 delphimqtt/
 ├── src/
-│   ├── MQTT.Types.pas       # Type definitions, exceptions, enums
-│   ├── MQTT.Protocol.pas    # MQTT protocol encoding/decoding
-│   ├── MQTT.Logger.pas      # IMQTTLogger + console/file/null implementations
-│   └── MQTT.Client.pas      # High-level client implementation
+│   ├── MQTT.Types.pas              # Type definitions, exceptions, enums
+│   ├── MQTT.Protocol.pas           # MQTT protocol encoding/decoding
+│   ├── MQTT.Logger.pas             # IMQTTLogger + Null/Proc impls (zero deps)
+│   ├── MQTT.Logger.LoggerPro.pas   # OPTIONAL adapter for LoggerPro
+│   └── MQTT.Client.pas             # High-level client implementation
 ├── samples/
 │   ├── 01_Connect/          # Basic connection example
 │   ├── 02_PublishSubscribe/ # Pub/Sub messaging
@@ -563,8 +607,9 @@ delphimqtt/
 │   │   ├── SSLPublicBroker.dpr   # Connect to public SSL brokers
 │   │   ├── SSLClientCert.dpr     # Mutual TLS with client certs
 │   │   └── TestAllBrokers.dpr    # Test all public SSL brokers
-│   ├── 11_Logging/          # Logger + packet monitoring + SUBACK event
-│   └── 12_WebChat/          # Delphi (TCP) <-> 2 browser pages (WebSocket)
+│   ├── 11_Logging/          # IMQTTLogger interface + packet events + SUBACK event
+│   ├── 12_WebChat/          # Delphi (TCP) <-> 2 browser pages (WebSocket)
+│   └── 13_LoggerPro/        # Wiring LoggerPro as the MQTT logger (async)
 ├── tests/
 │   ├── MqttTests.dpr               # DUnitX runner
 │   ├── MQTTProtocolTests.pas       # Protocol unit tests (no broker)
@@ -581,60 +626,132 @@ delphimqtt/
 Demonstrates how to use traditional Delphi method pointers (`of object`) instead of anonymous methods for event handlers.
 
 ### 09_VCL_Chat - Multi-Instance Chat
-A complete VCL chat application demonstrating:
-- Multiple clients in separate application instances
-- Real-time message exchange with JSON payloads
-- Presence announcements (online/offline status)
-- Room-based conversations
-- Thread-safe UI updates
+A complete VCL chat application demonstrating multiple clients exchanging
+JSON messages with presence announcements and thread-safe UI updates. Run
+multiple instances and join the same room to chat.
 
-Run multiple instances and join the same room to chat!
+### 11_Logging - IMQTTLogger interface
+Shows how to subscribe to every log line, every TX/RX packet and every
+SUBACK confirmation using only the trivial inline `TMQTTProcLogger`. No
+external logging dependency required.
+
+### 12_WebChat - Delphi ↔ 2 browser pages
+Three-way chat where a Delphi console client and two HTML pages all talk
+through one Mosquitto broker — the Delphi side over **TCP**, the browser
+pages over **WebSocket** (via [MQTT.js](https://github.com/mqttjs/MQTT.js)).
+Demonstrates retained presence + Last Will. See
+`scripts/mosquitto/apply-websockets.py` to enable the WebSocket listener.
+
+### 13_LoggerPro - Production logging via LoggerPro
+Plugs [LoggerPro](https://github.com/danieleteti/loggerpro) into the MQTT
+client through `WrapLoggerPro(...)`. Async worker threads, console +
+rotated file appenders, tag-based filtering — all wired in three lines.
 
 ## Requirements
 
-- Delphi 10.3 Rio or newer
+- Delphi 12 (Athens) — older versions work for the core library but the
+  shipped `.dproj` files target RAD Studio 37.0
 - Indy TCP components (standard in Delphi)
 - MQTT broker (e.g., Mosquitto) for testing
 - OpenSSL DLLs (for SSL/TLS connections only)
+- LoggerPro (only for `samples/13_LoggerPro` and any project using the
+  `MQTT.Logger.LoggerPro` adapter)
+
+## Build (msbuild)
+
+All projects build via **msbuild** against their `.dproj` (Win64 by
+default). The repository ships a Python orchestrator:
+
+```cmd
+python scripts\build-all.py                     :: Debug / Win64, every .dproj
+python scripts\build-all.py --config Release
+python scripts\build-all.py --platform Win32
+python scripts\build-all.py --only tests        :: filter by path substring
+```
+
+The orchestrator initializes the RAD Studio environment (`rsvars.bat`), adds
+the .NET `FrameworkDir` to `PATH` for `msbuild.exe`, then runs the build
+serially with a one-line PASS/FAIL summary per project.
+
+Behind the scenes, each project is a regular Delphi `.dproj` you can also
+open in the IDE. Helper scripts keep them in sync:
+
+- `scripts/patch_dprojs.py` — idempotent patcher that ensures every `.dproj`
+  has the `MQTT.Logger.pas` DCCReference, the right unit search path and
+  the Win64 platform groups enabled.
+- `scripts/regen_dprojs.py` + `scripts/dproj_template.py` — generate the
+  `.dproj` files for new samples or tests from a Win32+Win64 console
+  template.
 
 ## Testing
 
-A DUnitX test suite ships in `tests/`. It covers three layers:
+A DUnitX test suite ships in `tests/`. It covers four layers:
 
 | Suite | What it covers | Broker needed |
 |-------|----------------|---------------|
 | `MQTTProtocolTests` | Variable-length encoding, UTF-8 strings, wildcard matching, packet build/parse round-trips | No |
-| `MQTTLoggerTests` | Console / file / null loggers, level filtering, file append vs truncate | No |
+| `MQTTLoggerTests` | `TMQTTNullLogger`, `TMQTTProcLogger`, level filtering, exception swallowing | No |
 | `MQTTClientTests` | Connect lifecycle, QoS 0/1/2 round-trip, wildcard subscribe, packet events, SUBACK event, retain flag, logger integration | Yes — `localhost:1883` |
 | `MQTTPublicBrokerTests` | Plain + SSL connect/round-trip against `test.mosquitto.org`, `broker.hivemq.com`, `broker.emqx.io` | Internet, OpenSSL DLLs for SSL |
 
-Public broker tests soft-skip (`Assert.Pass` with reason) if the host is unreachable
-or the round-trip times out, so flaky public infrastructure does not fail the build.
+Public broker tests soft-skip (`Assert.Pass` with reason) if the host is
+unreachable or the round-trip times out, so flaky public infrastructure
+does not fail the build.
 
-### Build & Run
+### Build & run
 
-```batch
-cd tests
-dcc64 MqttTests.dpr ^
-  -U"..\src;C:\Program Files (x86)\Embarcadero\Studio\37.0\source\DUnitX" ^
-  -I"C:\Program Files (x86)\Embarcadero\Studio\37.0\source\DUnitX"
-
-MqttTests.exe --exitbehavior:Continue
+```cmd
+python scripts\build-all.py --only tests
+tests\MqttTests.exe --exitbehavior:Continue
 ```
 
 For SSL public-broker tests, copy `libeay32.dll` and `ssleay32.dll` next to
 `MqttTests.exe` (the same DLLs used in `samples/10_SSL/`).
 
+### Cross-protocol tests (TCP ↔ WebSocket)
+
+`scripts/cross-protocol-tests/run_cross_tests.py` orchestrates three
+round-trip scenarios between the Delphi MQTT client and a Python
+paho-mqtt WebSocket client through the same Mosquitto broker:
+
+```
+delphi -> delphi      (TCP -> TCP)
+delphi -> websocket   (TCP pub -> WS sub)
+websocket -> delphi   (WS pub -> TCP sub)
+```
+
+Run it after enabling the Mosquitto WebSocket listener:
+
+```cmd
+python scripts\mosquitto\apply-websockets.py        :: requires admin
+python scripts\build-all.py --only cross-protocol-tests
+python scripts\cross-protocol-tests\run_cross_tests.py
+```
+
 ## Version History
 
 ### 1.0.0 (2026-05-16)
 - **Production-ready release**
-- Added `IMQTTLogger` interface with `TMQTTConsoleLogger`, `TMQTTFileLogger`, `TMQTTNullLogger`
-- Added `Logger` property on `IMQTTClient` (defaults to null logger - zero overhead)
+- Added `IMQTTLogger` interface with `TMQTTNullLogger` (default, zero overhead)
+  and `TMQTTProcLogger` (inline `reference to procedure` forwarder for samples)
+- Added optional **LoggerPro adapter** in `MQTT.Logger.LoggerPro.pas`
+  (`WrapLoggerPro(ILogWriter, Tag, MinLevel)`) — async, multi-appender logging
+  without any dependency in the core library
+- Added `Logger` property on `IMQTTClient`
 - Added `OnPacketSent` / `OnPacketReceived` events for per-packet monitoring
 - Added `OnSubscribeAck` event exposing the QoS granted by the broker
 - Added internal log lines on connect, disconnect, reconnect, subscribe, error
-- Added 11_Logging sample demonstrating all the above
+- Added 11_Logging sample (inline `TMQTTProcLogger` demo)
+- Added 13_LoggerPro sample (LoggerPro adapter with console + rotated file
+  appenders)
+- Added 12_WebChat sample (3-way chat: Delphi TCP + 2 browser pages over
+  WebSocket on the same Mosquitto broker)
+- Migrated build system to **msbuild** against `.dproj` (Win64 by default).
+  `scripts/build-all.py` orchestrates an end-to-end build; helper scripts
+  patch / regenerate `.dproj` files
+- Added DUnitX test suite (61 tests covering protocol, logger, client
+  integration, public-broker round-trips) and Python cross-protocol
+  orchestrator (TCP↔WebSocket)
 - Verified retain flag exposure in `Publish` API
 
 ### 0.9.0 (2026-01-20)
