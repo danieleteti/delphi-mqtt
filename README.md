@@ -565,7 +565,11 @@ delphimqtt/
 │   │   └── TestAllBrokers.dpr    # Test all public SSL brokers
 │   └── 11_Logging/          # Logger + packet monitoring + SUBACK event
 ├── tests/
-│   └── MqttTests.dpr        # DUnitX unit tests
+│   ├── MqttTests.dpr               # DUnitX runner
+│   ├── MQTTProtocolTests.pas       # Protocol unit tests (no broker)
+│   ├── MQTTLoggerTests.pas         # Logger unit tests (no broker)
+│   ├── MQTTClientTests.pas         # Client integration tests (localhost:1883)
+│   └── MQTTPublicBrokerTests.pas   # Public broker tests (Mosquitto/HiveMQ/EMQX, plain + SSL)
 └── scripts/
     └── build.py             # Build automation
 ```
@@ -591,6 +595,34 @@ Run multiple instances and join the same room to chat!
 - Indy TCP components (standard in Delphi)
 - MQTT broker (e.g., Mosquitto) for testing
 - OpenSSL DLLs (for SSL/TLS connections only)
+
+## Testing
+
+A DUnitX test suite ships in `tests/`. It covers three layers:
+
+| Suite | What it covers | Broker needed |
+|-------|----------------|---------------|
+| `MQTTProtocolTests` | Variable-length encoding, UTF-8 strings, wildcard matching, packet build/parse round-trips | No |
+| `MQTTLoggerTests` | Console / file / null loggers, level filtering, file append vs truncate | No |
+| `MQTTClientTests` | Connect lifecycle, QoS 0/1/2 round-trip, wildcard subscribe, packet events, SUBACK event, retain flag, logger integration | Yes — `localhost:1883` |
+| `MQTTPublicBrokerTests` | Plain + SSL connect/round-trip against `test.mosquitto.org`, `broker.hivemq.com`, `broker.emqx.io` | Internet, OpenSSL DLLs for SSL |
+
+Public broker tests soft-skip (`Assert.Pass` with reason) if the host is unreachable
+or the round-trip times out, so flaky public infrastructure does not fail the build.
+
+### Build & Run
+
+```batch
+cd tests
+dcc64 MqttTests.dpr ^
+  -U"..\src;C:\Program Files (x86)\Embarcadero\Studio\37.0\source\DUnitX" ^
+  -I"C:\Program Files (x86)\Embarcadero\Studio\37.0\source\DUnitX"
+
+MqttTests.exe --exitbehavior:Continue
+```
+
+For SSL public-broker tests, copy `libeay32.dll` and `ssleay32.dll` next to
+`MqttTests.exe` (the same DLLs used in `samples/10_SSL/`).
 
 ## Version History
 

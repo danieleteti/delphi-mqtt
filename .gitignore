@@ -16,3 +16,4 @@ Win64/
 Debug/
 Release/
 /.claude/settings.local.json
+tests/dunitx-results.xml
