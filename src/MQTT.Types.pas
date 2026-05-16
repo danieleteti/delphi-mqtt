@@ -7,9 +7,9 @@ uses
   System.Generics.Collections;
 
 const
-  MQTT_LIB_VERSION = '0.8.0';
-  MQTT_LIB_VERSION_MAJOR = 0;
-  MQTT_LIB_VERSION_MINOR = 8;
+  MQTT_LIB_VERSION = '1.0.0';
+  MQTT_LIB_VERSION_MAJOR = 1;
+  MQTT_LIB_VERSION_MINOR = 0;
   MQTT_LIB_VERSION_PATCH = 0;
 
 type
@@ -54,6 +54,31 @@ type
     Connected,
     Reconnecting
   );
+
+  TMQTTSSLMethod = (
+    sslAuto,      // Auto-negotiate best available
+    sslTLS1,      // TLS 1.0
+    sslTLS1_1,    // TLS 1.1
+    sslTLS1_2,    // TLS 1.2 (recommended minimum)
+    sslTLS1_3     // TLS 1.3 (if supported by OpenSSL)
+  );
+
+  TMQTTSSLVerifyMode = (
+    sslVerifyNone,      // No certificate verification (insecure, for testing)
+    sslVerifyPeer       // Verify server certificate (recommended)
+  );
+
+  TMQTTSSLOptions = record
+    Enabled: Boolean;
+    CertFile: string;         // Client certificate file (PEM format)
+    KeyFile: string;          // Client private key file (PEM format)
+    RootCertFile: string;     // CA root certificate file (PEM format)
+    KeyPassword: string;      // Password for private key (if encrypted)
+    Method: TMQTTSSLMethod;
+    VerifyMode: TMQTTSSLVerifyMode;
+    VerifyDepth: Integer;     // Certificate chain verification depth
+    procedure SetDefaults;
+  end;
 
   TMQTTReasonCode = (
     rcSuccess = 0,
@@ -225,7 +250,32 @@ type
   TMQTTManualAckHandler = reference to procedure(const Topic: string; const Payload: TBytes; Dup: Boolean; var Ack: Boolean);
   TMQTTManualAckEvent = procedure(const Topic: string; const Payload: TBytes; Dup: Boolean; var Ack: Boolean) of object;
 
+  // Packet monitoring (P3) - fired on every packet sent/received
+  // Direction: True = received, False = sent
+  TMQTTPacketHandler = reference to procedure(PacketType: TMQTTPacketType; const RawPacket: TBytes);
+  TMQTTPacketEvent = procedure(PacketType: TMQTTPacketType; const RawPacket: TBytes) of object;
+
+  // Subscription acknowledgment (P4) - fired when broker confirms SUBSCRIBE
+  // GrantedQoS contains the QoS actually granted by the broker per topic filter
+  // (0x80 / 128 = failure / not authorized)
+  TMQTTSubscribeAckHandler = reference to procedure(PacketID: Word; const GrantedQoS: TArray<Byte>);
+  TMQTTSubscribeAckEvent = procedure(PacketID: Word; const GrantedQoS: TArray<Byte>) of object;
+
 implementation
+
+{ TMQTTSSLOptions }
+
+procedure TMQTTSSLOptions.SetDefaults;
+begin
+  Enabled := False;
+  CertFile := '';
+  KeyFile := '';
+  RootCertFile := '';
+  KeyPassword := '';
+  Method := sslTLS1_2;
+  VerifyMode := sslVerifyPeer;
+  VerifyDepth := 9;
+end;
 
 { TMQTTWillOptions }
 

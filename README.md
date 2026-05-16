@@ -1,6 +1,6 @@
 # Delphi MQTT Library
 
-[![Version](https://img.shields.io/badge/version-0.8.0-blue.svg)](https://github.com/your-repo/delphimqtt)
+[![Version](https://img.shields.io/badge/version-1.0.0-blue.svg)](https://github.com/your-repo/delphimqtt)
 [![License](https://img.shields.io/badge/license-Apache%202.0-green.svg)](LICENSE)
 
 A native MQTT client library for Delphi supporting both MQTT 3.1.1 and MQTT 5.0.
@@ -8,6 +8,7 @@ A native MQTT client library for Delphi supporting both MQTT 3.1.1 and MQTT 5.0.
 ## Features
 
 - **Full MQTT 5.0 Support**: Protocol version 5 with properties, reason codes, and enhanced features
+- **SSL/TLS Support**: Secure connections with TLS 1.2 and client certificate authentication
 - **Complete QoS Support**: QoS 0, 1, and 2 with proper acknowledgment flows
 - **Topic Wildcards**: Full support for `+` (single-level) and `#` (multi-level) wildcards
 - **Automatic Reconnection**: Configurable auto-reconnect with exponential backoff
@@ -19,6 +20,9 @@ A native MQTT client library for Delphi supporting both MQTT 3.1.1 and MQTT 5.0.
 - **Extended Subscriptions**: Access to Dup flag and QoS for redelivery detection
 - **Manual Acknowledgment**: Fine-grained control over message acknowledgment
 - **Synchronous Publishing**: Optional blocking publish with acknowledgment wait
+- **Pluggable Logging**: `IMQTTLogger` interface with console + file implementations
+- **Packet Monitoring**: `OnPacketReceived` / `OnPacketSent` hooks for debugging and metrics
+- **SUBACK Visibility**: `OnSubscribeAck` exposes the QoS granted by the broker per topic
 - **Minimal Dependencies**: Only requires Indy (bundled with Delphi)
 
 ## Quick Start
@@ -179,6 +183,184 @@ begin
   Client.Connect('localhost', 1883, Options);
 end;
 ```
+
+## SSL/TLS Connections
+
+Connect securely to MQTT brokers using TLS encryption.
+
+### Basic SSL Connection
+
+```pascal
+var
+  Client: IMQTTClient;
+begin
+  Client := CreateMQTTClient;
+
+  // Simple SSL connection to public broker
+  Client.ConnectSSL('test.mosquitto.org', 8883);
+
+  // Or with explicit SSL options
+  var SSLOptions: TMQTTSSLOptions;
+  SSLOptions.SetDefaults;
+  SSLOptions.Enabled := True;
+  SSLOptions.Method := sslTLS1_2;
+  SSLOptions.VerifyMode := sslVerifyNone;  // For testing only
+
+  Client.Connect('test.mosquitto.org', 8883, Options, SSLOptions);
+end;
+```
+
+### Client Certificate Authentication (Mutual TLS)
+
+For AWS IoT, Azure IoT Hub, and enterprise brokers:
+
+```pascal
+var
+  Client: IMQTTClient;
+  Options: TMQTTConnectOptions;
+  SSLOptions: TMQTTSSLOptions;
+begin
+  Client := CreateMQTTClient;
+
+  Options.SetDefaults;
+  Options.ClientID := 'MyIoTDevice';
+
+  SSLOptions.SetDefaults;
+  SSLOptions.Enabled := True;
+  SSLOptions.Method := sslTLS1_2;
+  SSLOptions.VerifyMode := sslVerifyPeer;
+
+  // Certificate files (PEM format)
+  SSLOptions.CertFile := 'certs/client.crt';
+  SSLOptions.KeyFile := 'certs/client.key';
+  SSLOptions.RootCertFile := 'certs/AmazonRootCA1.pem';
+  SSLOptions.KeyPassword := '';  // If key is encrypted
+
+  Client.Connect('your-endpoint.iot.region.amazonaws.com', 8883, Options, SSLOptions);
+end;
+```
+
+### SSL Options Reference
+
+```pascal
+TMQTTSSLOptions = record
+  Enabled: Boolean;              // Enable SSL/TLS
+  CertFile: string;              // Client certificate (PEM)
+  KeyFile: string;               // Private key (PEM)
+  RootCertFile: string;          // CA root certificate (PEM)
+  KeyPassword: string;           // Private key password
+  Method: TMQTTSSLMethod;        // TLS version
+  VerifyMode: TMQTTSSLVerifyMode; // Certificate verification
+  VerifyDepth: Integer;          // Verification chain depth
+end;
+
+// TLS versions
+TMQTTSSLMethod = (sslAuto, sslTLS1, sslTLS1_1, sslTLS1_2, sslTLS1_3);
+
+// Verification modes
+TMQTTSSLVerifyMode = (sslVerifyNone, sslVerifyPeer);
+```
+
+### Tested Public SSL Brokers
+
+The following public MQTT brokers have been tested with SSL/TLS support:
+
+| Broker | Host | Port | Status |
+|--------|------|------|--------|
+| Eclipse Mosquitto | test.mosquitto.org | 8883 | ✅ Working |
+| HiveMQ Public | broker.hivemq.com | 8883 | ✅ Working |
+| EMQX Public | broker.emqx.io | 8883 | ⚠️ May have connectivity issues |
+| Eclipse IoT | mqtt.eclipseprojects.io | 8883 | ⚠️ May have connectivity issues |
+
+Run the `TestAllBrokers.dpr` sample in `samples/10_SSL` to verify connectivity from your network.
+
+### OpenSSL Requirements
+
+SSL/TLS requires OpenSSL 1.0.2 DLLs (Indy uses the older API):
+- **32-bit and 64-bit**: `libeay32.dll`, `ssleay32.dll`
+
+Download OpenSSL 1.0.2 from: https://slproweb.com/products/Win32OpenSSL.html
+
+Place the DLLs in the same folder as your executable or in the system PATH.
+
+**Note**: Newer OpenSSL 1.1.x/3.x DLLs (`libssl-1_1-x64.dll`, `libcrypto-1_1-x64.dll`) are NOT compatible with Indy's default SSL implementation. Use the legacy 1.0.2 DLLs.
+
+### SSL Samples
+
+Three SSL samples are provided in `samples/10_SSL/`:
+
+1. **SSLPublicBroker.dpr** - Interactive demo connecting to a public broker with TLS
+2. **SSLClientCert.dpr** - Template for AWS IoT / Azure IoT Hub with mutual TLS
+3. **TestAllBrokers.dpr** - Automated test of all public SSL brokers
+
+## Logging
+
+The client exposes an `IMQTTLogger` interface so you can plug in any logging backend.
+Two built-in implementations ship in `MQTT.Logger`:
+
+- `TMQTTConsoleLogger` — thread-safe `Writeln` (console apps only)
+- `TMQTTFileLogger` — thread-safe append-mode UTF-8 file writer
+- `TMQTTNullLogger` — silent default; no overhead when no logger is set
+
+```pascal
+uses MQTT.Client, MQTT.Logger, MQTT.Types;
+
+var
+  Client: IMQTTClient;
+begin
+  Client := CreateMQTTClient;
+
+  // Console logger at DEBUG level - logs every TX/RX packet
+  Client.Logger := CreateConsoleLogger(llDebug);
+
+  // Or write to a file
+  // Client.Logger := CreateFileLogger('mqtt.log', True, llInfo);
+
+  Client.Connect('localhost', 1883);
+end;
+```
+
+Log levels (lowest to highest): `llDebug`, `llInfo`, `llWarning`, `llError`, `llNone`.
+
+## Packet Monitoring
+
+Hook every inbound and outbound packet for debugging, metrics or audit:
+
+```pascal
+Client.SetOnPacketSent(
+  procedure(PT: TMQTTPacketType; const Raw: TBytes)
+  begin
+    Writeln('TX ', GetEnumName(TypeInfo(TMQTTPacketType), Ord(PT)),
+            ' (', Length(Raw), ' bytes)');
+  end);
+
+Client.SetOnPacketReceived(
+  procedure(PT: TMQTTPacketType; const Raw: TBytes)
+  begin
+    // count, dump, store, ...
+  end);
+```
+
+## Subscription Acknowledgment
+
+Get the QoS actually granted by the broker per topic filter (or detect rejection):
+
+```pascal
+Client.SetOnSubscribeAck(
+  procedure(PacketID: Word; const GrantedQoS: TArray<Byte>)
+  var
+    Code: Byte;
+  begin
+    for Code in GrantedQoS do
+      if Code >= $80 then
+        Writeln('Subscription rejected: code=', Code)
+      else
+        Writeln('Granted QoS=', Code);
+  end);
+```
+
+A value `>= $80` (typically `128`) means the broker refused the subscription
+(e.g. not authorized, wildcard not supported).
 
 ## Quality of Service (QoS)
 
@@ -365,6 +547,7 @@ delphimqtt/
 ├── src/
 │   ├── MQTT.Types.pas       # Type definitions, exceptions, enums
 │   ├── MQTT.Protocol.pas    # MQTT protocol encoding/decoding
+│   ├── MQTT.Logger.pas      # IMQTTLogger + console/file/null implementations
 │   └── MQTT.Client.pas      # High-level client implementation
 ├── samples/
 │   ├── 01_Connect/          # Basic connection example
@@ -375,7 +558,12 @@ delphimqtt/
 │   ├── 06_Reconnection/     # Auto-reconnect feature
 │   ├── 07_WillMessage/      # Last Will and Testament
 │   ├── 08_MethodPointers/   # Using method pointers (of object)
-│   └── 09_VCL_Chat/         # Multi-instance VCL chat application
+│   ├── 09_VCL_Chat/         # Multi-instance VCL chat application
+│   ├── 10_SSL/              # SSL/TLS secure connections
+│   │   ├── SSLPublicBroker.dpr   # Connect to public SSL brokers
+│   │   ├── SSLClientCert.dpr     # Mutual TLS with client certs
+│   │   └── TestAllBrokers.dpr    # Test all public SSL brokers
+│   └── 11_Logging/          # Logger + packet monitoring + SUBACK event
 ├── tests/
 │   └── MqttTests.dpr        # DUnitX unit tests
 └── scripts/
@@ -402,8 +590,31 @@ Run multiple instances and join the same room to chat!
 - Delphi 10.3 Rio or newer
 - Indy TCP components (standard in Delphi)
 - MQTT broker (e.g., Mosquitto) for testing
+- OpenSSL DLLs (for SSL/TLS connections only)
 
 ## Version History
+
+### 1.0.0 (2026-05-16)
+- **Production-ready release**
+- Added `IMQTTLogger` interface with `TMQTTConsoleLogger`, `TMQTTFileLogger`, `TMQTTNullLogger`
+- Added `Logger` property on `IMQTTClient` (defaults to null logger - zero overhead)
+- Added `OnPacketSent` / `OnPacketReceived` events for per-packet monitoring
+- Added `OnSubscribeAck` event exposing the QoS granted by the broker
+- Added internal log lines on connect, disconnect, reconnect, subscribe, error
+- Added 11_Logging sample demonstrating all the above
+- Verified retain flag exposure in `Publish` API
+
+### 0.9.0 (2026-01-20)
+- **Added SSL/TLS support** with TLS 1.2
+- Added `ConnectSSL()` methods for easy secure connections
+- Added `TMQTTSSLOptions` for fine-grained SSL configuration
+- Added client certificate authentication (Mutual TLS)
+- Added SSL samples (10_SSL):
+  - `SSLPublicBroker.dpr` - Connect to public SSL brokers
+  - `SSLClientCert.dpr` - Mutual TLS for AWS/Azure IoT
+  - `TestAllBrokers.dpr` - Automated testing of all public brokers
+- Tested with Eclipse Mosquitto, HiveMQ, EMQX, Eclipse IoT
+- Requires OpenSSL 1.0.2 DLLs (libeay32.dll, ssleay32.dll)
 
 ### 0.8.0 (2026-01-19)
 - Added `SubscribeEx` for extended handlers with Dup flag and QoS info

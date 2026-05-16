@@ -14,8 +14,11 @@ uses
   IdGlobal,
   IdException,
   IdExceptionCore,
+  IdSSLOpenSSL,
+  IdSSLOpenSSLHeaders,
   MQTT.Types,
-  MQTT.Protocol;
+  MQTT.Protocol,
+  MQTT.Logger;
 
 type
   TMQTTHandler = reference to procedure(const Topic: string; const Payload: TBytes);
@@ -54,6 +57,10 @@ type
     ['{6E69B8A7-88D4-4B3A-B6B1-D6502E7A0F7E}']
     procedure Connect(const Host: string; Port: Word = 1883); overload;
     procedure Connect(const Host: string; Port: Word; const Options: TMQTTConnectOptions); overload;
+    procedure Connect(const Host: string; Port: Word; const Options: TMQTTConnectOptions; const SSLOptions: TMQTTSSLOptions); overload;
+    procedure ConnectSSL(const Host: string; Port: Word = 8883); overload;
+    procedure ConnectSSL(const Host: string; Port: Word; const Options: TMQTTConnectOptions); overload;
+    procedure ConnectSSL(const Host: string; Port: Word; const Options: TMQTTConnectOptions; const SSLOptions: TMQTTSSLOptions); overload;
     procedure Disconnect;
     procedure Publish(const Topic: string; const Payload: string; QoS: TMQTTQoS = atMostOnce; Retain: Boolean = False); overload;
     procedure Publish(const Topic: string; const Payload: TBytes; QoS: TMQTTQoS = atMostOnce; Retain: Boolean = False); overload;
@@ -75,14 +82,25 @@ type
     procedure SetOnError(Handler: TMQTTErrorEvent); overload;
     procedure SetOnConnect(Handler: TMQTTConnectHandler); overload;
     procedure SetOnConnect(Handler: TMQTTConnectEvent); overload;
+    procedure SetOnPacketReceived(Handler: TMQTTPacketHandler); overload;
+    procedure SetOnPacketReceived(Handler: TMQTTPacketEvent); overload;
+    procedure SetOnPacketSent(Handler: TMQTTPacketHandler); overload;
+    procedure SetOnPacketSent(Handler: TMQTTPacketEvent); overload;
+    procedure SetOnSubscribeAck(Handler: TMQTTSubscribeAckHandler); overload;
+    procedure SetOnSubscribeAck(Handler: TMQTTSubscribeAckEvent); overload;
+    procedure SetLogger(const Logger: IMQTTLogger);
+    function GetLogger: IMQTTLogger;
     property Connected: Boolean read IsConnected;
     property State: TMQTTConnectionState read GetState;
     property AutoReconnect: Boolean read GetAutoReconnect write SetAutoReconnect;
+    property Logger: IMQTTLogger read GetLogger write SetLogger;
   end;
 
   TMQTTClient = class(TInterfacedObject, IMQTTClient)
   private
     FIndy: TIdTCPClient;
+    FSSLHandler: TIdSSLIOHandlerSocketOpenSSL;
+    FSSLOptions: TMQTTSSLOptions;
     FState: TMQTTConnectionState;
     FReceiver: ITask;
     FPinger: ITask;
@@ -102,6 +120,10 @@ type
     FOnDisconnect: TMQTTDisconnectHandler;
     FOnError: TMQTTErrorHandler;
     FOnConnect: TMQTTConnectHandler;
+    FOnPacketReceived: TMQTTPacketHandler;
+    FOnPacketSent: TMQTTPacketHandler;
+    FOnSubscribeAck: TMQTTSubscribeAckHandler;
+    FLogger: IMQTTLogger;
     FShutdown: Boolean;
     FPendingAckEvent: TEvent;
 
@@ -138,11 +160,30 @@ type
     procedure SetOnError(Handler: TMQTTErrorEvent); overload;
     procedure SetOnConnect(Handler: TMQTTConnectHandler); overload;
     procedure SetOnConnect(Handler: TMQTTConnectEvent); overload;
+    procedure SetOnPacketReceived(Handler: TMQTTPacketHandler); overload;
+    procedure SetOnPacketReceived(Handler: TMQTTPacketEvent); overload;
+    procedure SetOnPacketSent(Handler: TMQTTPacketHandler); overload;
+    procedure SetOnPacketSent(Handler: TMQTTPacketEvent); overload;
+    procedure SetOnSubscribeAck(Handler: TMQTTSubscribeAckHandler); overload;
+    procedure SetOnSubscribeAck(Handler: TMQTTSubscribeAckEvent); overload;
+    procedure SetLogger(const Logger: IMQTTLogger);
+    function GetLogger: IMQTTLogger;
+    procedure NotifyPacketSent(const Packet: TBytes);
+    procedure NotifyPacketReceived(const Packet: TBytes);
+    function PacketTypeName(PT: TMQTTPacketType): string;
+    procedure ConfigureSSL;
+    procedure CleanupSSL;
+    function GetSSLMethodVersion(Method: TMQTTSSLMethod): TIdSSLVersion;
+    procedure SSLGetPassword(var Password: string);
   public
     constructor Create;
     destructor Destroy; override;
     procedure Connect(const Host: string; Port: Word = 1883); overload;
     procedure Connect(const Host: string; Port: Word; const Options: TMQTTConnectOptions); overload;
+    procedure Connect(const Host: string; Port: Word; const Options: TMQTTConnectOptions; const SSLOptions: TMQTTSSLOptions); overload;
+    procedure ConnectSSL(const Host: string; Port: Word = 8883); overload;
+    procedure ConnectSSL(const Host: string; Port: Word; const Options: TMQTTConnectOptions); overload;
+    procedure ConnectSSL(const Host: string; Port: Word; const Options: TMQTTConnectOptions; const SSLOptions: TMQTTSSLOptions); overload;
     procedure Disconnect;
     procedure Publish(const Topic: string; const Payload: string; QoS: TMQTTQoS = atMostOnce; Retain: Boolean = False); overload;
     procedure Publish(const Topic: string; const Payload: TBytes; QoS: TMQTTQoS = atMostOnce; Retain: Boolean = False); overload;
@@ -173,6 +214,8 @@ begin
   FIndy := TIdTCPClient.Create(nil);
   FIndy.ConnectTimeout := 5000;
   FIndy.ReadTimeout := 100;
+  FSSLHandler := nil;
+  FSSLOptions.SetDefaults;
   FSubscriptions := TDictionary<string, TSubscriptionInfo>.Create;
   FPendingPublish := TDictionary<Word, TPendingPublish>.Create;
   FPendingQoS2Inbound := TDictionary<Word, TPendingQoS2Inbound>.Create;
@@ -185,6 +228,7 @@ begin
   FReconnectDelayMs := 1000;
   FMaxReconnectDelayMs := 30000;
   FShutdown := False;
+  FLogger := CreateNullLogger;
   FOptions.SetDefaults;
 end;
 
@@ -192,6 +236,7 @@ destructor TMQTTClient.Destroy;
 begin
   FShutdown := True;
   Disconnect;
+  CleanupSSL;
   FPendingAckEvent.Free;
   FPendingQoS2Inbound.Free;
   FPendingPublish.Free;
@@ -275,6 +320,188 @@ begin
     FOnConnect := nil;
 end;
 
+procedure TMQTTClient.SetOnPacketReceived(Handler: TMQTTPacketHandler);
+begin
+  FOnPacketReceived := Handler;
+end;
+
+procedure TMQTTClient.SetOnPacketReceived(Handler: TMQTTPacketEvent);
+begin
+  if Assigned(Handler) then
+    FOnPacketReceived := procedure(PT: TMQTTPacketType; const Raw: TBytes)
+      begin Handler(PT, Raw); end
+  else
+    FOnPacketReceived := nil;
+end;
+
+procedure TMQTTClient.SetOnPacketSent(Handler: TMQTTPacketHandler);
+begin
+  FOnPacketSent := Handler;
+end;
+
+procedure TMQTTClient.SetOnPacketSent(Handler: TMQTTPacketEvent);
+begin
+  if Assigned(Handler) then
+    FOnPacketSent := procedure(PT: TMQTTPacketType; const Raw: TBytes)
+      begin Handler(PT, Raw); end
+  else
+    FOnPacketSent := nil;
+end;
+
+procedure TMQTTClient.SetOnSubscribeAck(Handler: TMQTTSubscribeAckHandler);
+begin
+  FOnSubscribeAck := Handler;
+end;
+
+procedure TMQTTClient.SetOnSubscribeAck(Handler: TMQTTSubscribeAckEvent);
+begin
+  if Assigned(Handler) then
+    FOnSubscribeAck := procedure(PacketID: Word; const GrantedQoS: TArray<Byte>)
+      begin Handler(PacketID, GrantedQoS); end
+  else
+    FOnSubscribeAck := nil;
+end;
+
+procedure TMQTTClient.SetLogger(const Logger: IMQTTLogger);
+begin
+  if Assigned(Logger) then
+    FLogger := Logger
+  else
+    FLogger := CreateNullLogger;
+end;
+
+function TMQTTClient.GetLogger: IMQTTLogger;
+begin
+  Result := FLogger;
+end;
+
+function TMQTTClient.PacketTypeName(PT: TMQTTPacketType): string;
+begin
+  case PT of
+    ptConnect:     Result := 'CONNECT';
+    ptConnAck:     Result := 'CONNACK';
+    ptPublish:     Result := 'PUBLISH';
+    ptPubAck:      Result := 'PUBACK';
+    ptPubRec:      Result := 'PUBREC';
+    ptPubRel:      Result := 'PUBREL';
+    ptPubComp:     Result := 'PUBCOMP';
+    ptSubscribe:   Result := 'SUBSCRIBE';
+    ptSubAck:      Result := 'SUBACK';
+    ptUnsubscribe: Result := 'UNSUBSCRIBE';
+    ptUnsubAck:    Result := 'UNSUBACK';
+    ptPingReq:     Result := 'PINGREQ';
+    ptPingResp:    Result := 'PINGRESP';
+    ptDisconnect:  Result := 'DISCONNECT';
+    ptAuth:        Result := 'AUTH';
+  else
+    Result := Format('UNKNOWN(%d)', [Ord(PT)]);
+  end;
+end;
+
+procedure TMQTTClient.NotifyPacketSent(const Packet: TBytes);
+var
+  PT: TMQTTPacketType;
+begin
+  if Length(Packet) = 0 then
+    Exit;
+  PT := TMQTTProtocol.GetPacketType(Packet);
+  FLogger.Debug('TX %s (%d bytes)', [PacketTypeName(PT), Length(Packet)]);
+  if Assigned(FOnPacketSent) then
+  begin
+    try
+      FOnPacketSent(PT, Packet);
+    except
+      // swallow handler exceptions
+    end;
+  end;
+end;
+
+procedure TMQTTClient.NotifyPacketReceived(const Packet: TBytes);
+var
+  PT: TMQTTPacketType;
+begin
+  if Length(Packet) = 0 then
+    Exit;
+  PT := TMQTTProtocol.GetPacketType(Packet);
+  FLogger.Debug('RX %s (%d bytes)', [PacketTypeName(PT), Length(Packet)]);
+  if Assigned(FOnPacketReceived) then
+  begin
+    try
+      FOnPacketReceived(PT, Packet);
+    except
+      // swallow handler exceptions
+    end;
+  end;
+end;
+
+function TMQTTClient.GetSSLMethodVersion(Method: TMQTTSSLMethod): TIdSSLVersion;
+begin
+  case Method of
+    sslTLS1:    Result := sslvTLSv1;
+    sslTLS1_1:  Result := sslvTLSv1_1;
+    sslTLS1_2:  Result := sslvTLSv1_2;
+    sslTLS1_3:  Result := sslvTLSv1_2; // Fallback to 1.2, TLS 1.3 needs TaurusTLS
+  else
+    Result := sslvTLSv1_2; // sslAuto defaults to TLS 1.2
+  end;
+end;
+
+procedure TMQTTClient.ConfigureSSL;
+begin
+  if not FSSLOptions.Enabled then
+    Exit;
+
+  // Clean up existing handler
+  CleanupSSL;
+
+  // Create new SSL handler
+  FSSLHandler := TIdSSLIOHandlerSocketOpenSSL.Create(nil);
+  FSSLHandler.SSLOptions.Method := GetSSLMethodVersion(FSSLOptions.Method);
+  FSSLHandler.SSLOptions.Mode := sslmClient;
+
+  // Configure verification mode
+  case FSSLOptions.VerifyMode of
+    sslVerifyNone:
+      FSSLHandler.SSLOptions.VerifyMode := [];
+    sslVerifyPeer:
+      FSSLHandler.SSLOptions.VerifyMode := [sslvrfPeer];
+  end;
+  FSSLHandler.SSLOptions.VerifyDepth := FSSLOptions.VerifyDepth;
+
+  // Configure certificates
+  if FSSLOptions.CertFile <> '' then
+    FSSLHandler.SSLOptions.CertFile := FSSLOptions.CertFile;
+  if FSSLOptions.KeyFile <> '' then
+    FSSLHandler.SSLOptions.KeyFile := FSSLOptions.KeyFile;
+  if FSSLOptions.RootCertFile <> '' then
+    FSSLHandler.SSLOptions.RootCertFile := FSSLOptions.RootCertFile;
+
+  // Configure password callback if needed
+  if FSSLOptions.KeyPassword <> '' then
+    FSSLHandler.OnGetPassword := SSLGetPassword;
+
+  // Attach handler to TCP client
+  FIndy.IOHandler := FSSLHandler;
+
+  // Enable SSL handshake (PassThrough = False means SSL is active)
+  FSSLHandler.PassThrough := False;
+end;
+
+procedure TMQTTClient.CleanupSSL;
+begin
+  if Assigned(FSSLHandler) then
+  begin
+    if FIndy.IOHandler = FSSLHandler then
+      FIndy.IOHandler := nil;
+    FreeAndNil(FSSLHandler);
+  end;
+end;
+
+procedure TMQTTClient.SSLGetPassword(var Password: string);
+begin
+  Password := FSSLOptions.KeyPassword;
+end;
+
 procedure TMQTTClient.Connect(const Host: string; Port: Word);
 var
   Options: TMQTTConnectOptions;
@@ -315,10 +542,12 @@ begin
     end;
 
     Packet := ReadPacket;
+    NotifyPacketReceived(Packet);
     if not TMQTTProtocol.ParseConnAck(Packet, Ord(Options.Version), SessionPresent, ReasonCode) then
     begin
       FIndy.Disconnect;
       FState := Disconnected;
+      FLogger.Error('Invalid CONNACK from %s:%d', [Host, Port]);
       raise EMQTTConnectionException.Create('Invalid CONNACK packet');
     end;
 
@@ -326,11 +555,18 @@ begin
     begin
       FIndy.Disconnect;
       FState := Disconnected;
+      FLogger.Error('Connection refused by %s:%d (reason code %d)', [Host, Port, ReasonCode]);
       raise EMQTTConnectionException.CreateFmt('Connection refused: reason code %d', [ReasonCode]);
     end;
 
     FState := Connected;
     FLastActivity := Now;
+    if SessionPresent then
+      FLogger.Info('Connected to %s:%d (ClientID="%s", MQTT v%d, SessionPresent=True)',
+        [Host, Port, Options.ClientID, Ord(Options.Version)])
+    else
+      FLogger.Info('Connected to %s:%d (ClientID="%s", MQTT v%d, SessionPresent=False)',
+        [Host, Port, Options.ClientID, Ord(Options.Version)]);
 
     // Start receiver thread
     FReceiver := TTask.Run(procedure begin ReceiverLoop; end);
@@ -346,11 +582,51 @@ begin
     on E: Exception do
     begin
       FState := Disconnected;
+      CleanupSSL;
       if FIndy.Connected then
         FIndy.Disconnect;
       raise;
     end;
   end;
+end;
+
+procedure TMQTTClient.Connect(const Host: string; Port: Word; const Options: TMQTTConnectOptions;
+  const SSLOptions: TMQTTSSLOptions);
+begin
+  FSSLOptions := SSLOptions;
+  if FSSLOptions.Enabled then
+    ConfigureSSL;
+  Connect(Host, Port, Options);
+end;
+
+procedure TMQTTClient.ConnectSSL(const Host: string; Port: Word);
+var
+  Options: TMQTTConnectOptions;
+  SSLOpts: TMQTTSSLOptions;
+begin
+  Options.SetDefaults;
+  SSLOpts.SetDefaults;
+  SSLOpts.Enabled := True;
+  Connect(Host, Port, Options, SSLOpts);
+end;
+
+procedure TMQTTClient.ConnectSSL(const Host: string; Port: Word; const Options: TMQTTConnectOptions);
+var
+  SSLOpts: TMQTTSSLOptions;
+begin
+  SSLOpts.SetDefaults;
+  SSLOpts.Enabled := True;
+  Connect(Host, Port, Options, SSLOpts);
+end;
+
+procedure TMQTTClient.ConnectSSL(const Host: string; Port: Word; const Options: TMQTTConnectOptions;
+  const SSLOptions: TMQTTSSLOptions);
+var
+  SSLOpts: TMQTTSSLOptions;
+begin
+  SSLOpts := SSLOptions;
+  SSLOpts.Enabled := True; // Force SSL enabled for ConnectSSL
+  Connect(Host, Port, Options, SSLOpts);
 end;
 
 procedure TMQTTClient.Disconnect;
@@ -361,6 +637,8 @@ begin
 
   if FState = Disconnected then
     Exit;
+
+  FLogger.Info('Disconnecting from %s:%d', [FHost, FPort]);
 
   // Send DISCONNECT packet
   if FIndy.Connected then
@@ -413,6 +691,7 @@ begin
   finally
     FWriteLock.Leave;
   end;
+  NotifyPacketSent(Packet);
 end;
 
 function TMQTTClient.ReadPacket: TBytes;
@@ -475,7 +754,10 @@ begin
 
       Packet := ReadPacket;
       if Length(Packet) > 0 then
+      begin
+        NotifyPacketReceived(Packet);
         HandlePacket(Packet);
+      end;
 
     except
       on E: EIdReadTimeout do
@@ -735,9 +1017,31 @@ procedure TMQTTClient.HandleSubAck(const Packet: TBytes);
 var
   PacketID: Word;
   ReasonCodes: TArray<Byte>;
+  I: Integer;
+  CodesStr: string;
 begin
-  TMQTTProtocol.ParseSubAck(Packet, Ord(FOptions.Version), PacketID, ReasonCodes);
-  // Subscription confirmed
+  if not TMQTTProtocol.ParseSubAck(Packet, Ord(FOptions.Version), PacketID, ReasonCodes) then
+    Exit;
+
+  if FLogger.MinLevel <= llInfo then
+  begin
+    CodesStr := '';
+    for I := 0 to High(ReasonCodes) do
+    begin
+      if I > 0 then CodesStr := CodesStr + ',';
+      CodesStr := CodesStr + IntToStr(ReasonCodes[I]);
+    end;
+    FLogger.Info('SUBACK PacketID=%d GrantedQoS=[%s]', [PacketID, CodesStr]);
+  end;
+
+  if Assigned(FOnSubscribeAck) then
+  begin
+    try
+      FOnSubscribeAck(PacketID, ReasonCodes);
+    except
+      // swallow handler exceptions
+    end;
+  end;
 end;
 
 procedure TMQTTClient.HandleUnsubAck(const Packet: TBytes);
@@ -969,6 +1273,7 @@ begin
 
   FState := Reconnecting;
   Delay := FReconnectDelayMs;
+  FLogger.Warning('Connection lost, attempting reconnect to %s:%d', [FHost, FPort]);
 
   while not FShutdown and (FState = Reconnecting) do
   begin
@@ -980,6 +1285,10 @@ begin
     try
       if FIndy.Connected then
         FIndy.Disconnect;
+
+      // Reconfigure SSL if enabled
+      if FSSLOptions.Enabled then
+        ConfigureSSL;
 
       FIndy.Host := FHost;
       FIndy.Port := FPort;
@@ -993,12 +1302,14 @@ begin
       if not FIndy.IOHandler.InputBufferIsEmpty then
       begin
         Packet := ReadPacket;
+        NotifyPacketReceived(Packet);
         var SessionPresent: Boolean;
         var ReasonCode: Byte;
         if TMQTTProtocol.ParseConnAck(Packet, Ord(FOptions.Version), SessionPresent, ReasonCode) and (ReasonCode = 0) then
         begin
           FState := Connected;
           FLastActivity := Now;
+          FLogger.Info('Reconnected to %s:%d', [FHost, FPort]);
 
           // Restart pinger if needed
           if (FOptions.KeepAliveSec > 0) and not Assigned(FPinger) then
@@ -1027,12 +1338,15 @@ procedure TMQTTClient.DoDisconnect(ReasonCode: TMQTTReasonCode; const ReasonStri
 begin
   FState := Disconnected;
 
+  FLogger.Info('Disconnected: reason=%d (%s)', [Ord(ReasonCode), ReasonString]);
+
   if Assigned(FOnDisconnect) then
     FOnDisconnect(ReasonCode, ReasonString);
 end;
 
 procedure TMQTTClient.DoError(const Msg: string);
 begin
+  FLogger.Error(Msg);
   if Assigned(FOnError) then
     FOnError(Msg);
 end;
@@ -1245,6 +1559,7 @@ begin
 
   PacketID := GetNextPacketID;
   Packet := TMQTTProtocol.BuildSubscribe(Ord(FOptions.Version), PacketID, Topic, QoS);
+  FLogger.Info('SUBSCRIBE PacketID=%d topic="%s" qos=%d', [PacketID, Topic, Ord(QoS)]);
   SendPacket(Packet);
 end;
 

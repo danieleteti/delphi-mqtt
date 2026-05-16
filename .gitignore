@@ -2,6 +2,17 @@
 *.dcu
 *.res
 *.local
+*.exe
+*.rsm
+*.map
+*.drc
+*.tds
+*.~*
 __history/
+__recovery/
 *.identcache
+Win32/
+Win64/
+Debug/
+Release/
 /.claude/settings.local.json
