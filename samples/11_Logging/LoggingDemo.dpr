@@ -2,16 +2,17 @@ program LoggingDemo;
 
 {$APPTYPE CONSOLE}
 
-{
-  Logging + Packet Monitoring + SUBACK Event Sample
+(*
+  Logging interface + packet monitoring + SUBACK event sample.
 
-  Demonstrates:
-  - IMQTTLogger interface (console + file)
-  - OnPacketReceived / OnPacketSent events
-  - OnSubscribeAck event with granted QoS
+  This sample uses the trivial in-process logger (CreateProcLogger) provided
+  by MQTT.Logger. It is meant to show the IMQTTLogger contract and how to
+  bridge it to any callback you want.
 
-  Requirements: MQTT broker running on localhost:1883
-}
+  For production logging through LoggerPro, see samples/13_LoggerPro/.
+
+  Requirements: MQTT broker on localhost:1883.
+*)
 
 uses
   System.SysUtils,
@@ -23,7 +24,6 @@ uses
 var
   Client: IMQTTClient;
   Options: TMQTTConnectOptions;
-  ConsoleLog: IMQTTLogger;
   PacketCounter: Integer;
 
 begin
@@ -35,9 +35,13 @@ begin
 
     Client := CreateMQTTClient;
 
-    // Attach a console logger (Debug = show all packets)
-    ConsoleLog := CreateConsoleLogger(llDebug);
-    Client.Logger := ConsoleLog;
+    // Trivial inline logger: prints "[LEVEL] msg" to stdout. Shows the contract.
+    Client.Logger := CreateProcLogger(
+      procedure(Level: TMQTTLogLevel; const Msg: string)
+      begin
+        Writeln(Format('[%-5s] %s', [LogLevelName(Level), Msg]));
+      end,
+      llDebug);
 
     // P3: per-packet inbound hook
     Client.SetOnPacketReceived(
@@ -46,7 +50,7 @@ begin
         Inc(PacketCounter);
       end);
 
-    // P3: per-packet outbound hook (could also be wired)
+    // P3: per-packet outbound hook
     Client.SetOnPacketSent(
       procedure(PT: TMQTTPacketType; const Raw: TBytes)
       begin
@@ -59,7 +63,7 @@ begin
       var
         I: Integer;
       begin
-        Write('[APP] SUBACK PacketID=', PacketID, ' granted: ');
+        Write('[APP  ] SUBACK PacketID=', PacketID, ' granted: ');
         for I := 0 to High(GrantedQoS) do
         begin
           if I > 0 then Write(',');
@@ -80,7 +84,7 @@ begin
     Client.Subscribe('demo/logging/+',
       procedure(const Topic: string; const Payload: TBytes)
       begin
-        Writeln('[APP] message on ', Topic, ': ', TEncoding.UTF8.GetString(Payload));
+        Writeln('[APP  ] message on ', Topic, ': ', TEncoding.UTF8.GetString(Payload));
       end,
       atLeastOnce);
 

@@ -1,15 +1,52 @@
-<?xml version="1.0" encoding="utf-8"?>
-<Project xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
+#!/usr/bin/env python3
+"""
+Generator for minimal Delphi console-app .dproj files with Win32+Win64
+enabled and Win64 build targets wired in.
+
+Used by scripts/regen_dprojs.py to (re)create the dproj files that don't
+exist in version control yet (tests, 11_Logging, 13_LoggerPro, cross-protocol
+helpers, etc.).
+"""
+
+from __future__ import annotations
+import uuid
+
+
+def make_dproj(*, main_source: str, project_name: str, dcc_references: list[str],
+               unit_search_path: str = "", extra_namespaces: str = "") -> str:
+    """Return the XML text of a minimal Win32+Win64 console .dproj.
+
+    main_source:       relative path to the .dpr (e.g. "LoggerProDemo.dpr")
+    project_name:      project name (e.g. "LoggerProDemo")
+    dcc_references:    list of relative paths to .pas units explicitly listed
+                       in the ItemGroup. Compile order matches the list.
+    unit_search_path:  semicolon-separated extra directories for DCC_UnitSearchPath
+    extra_namespaces:  extra namespaces to prepend to DCC_Namespace
+    """
+    guid = str(uuid.uuid4()).upper()
+    refs_xml = "\n".join(
+        f'        <DCCReference Include="{p}"/>' for p in dcc_references
+    )
+    search_xml = ""
+    if unit_search_path:
+        search_xml = (
+            f"\n        <DCC_UnitSearchPath>{unit_search_path};"
+            "$(DCC_UnitSearchPath)</DCC_UnitSearchPath>"
+        )
+    ns_prefix = ""
+    if extra_namespaces:
+        ns_prefix = f"{extra_namespaces};"
+
+    return f"""<Project xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
     <PropertyGroup>
-        <ProjectGuid>{A8C2F3E1-5B4D-4C6A-9E8F-1D2B3C4E5F6A}</ProjectGuid>
-        <MainSource>SSLPublicBroker.dpr</MainSource>
+        <ProjectGuid>{{{guid}}}</ProjectGuid>
+        <MainSource>{main_source}</MainSource>
         <Base>True</Base>
         <Config Condition="'$(Config)'==''">Debug</Config>
-        <ProjectName Condition="'$(ProjectName)'==''">SSLPublicBroker</ProjectName>
-        <TargetedPlatforms>3</TargetedPlatforms>
+        <ProjectName Condition="'$(ProjectName)'==''">{project_name}</ProjectName>
         <AppType>Console</AppType>
         <FrameworkType>None</FrameworkType>
-        <ProjectVersion>20.3</ProjectVersion>
+        <ProjectVersion>20.4</ProjectVersion>
         <Platform Condition="'$(Platform)'==''">Win64</Platform>
     </PropertyGroup>
     <PropertyGroup Condition="'$(Config)'=='Base' or '$(Base)'!=''">
@@ -42,47 +79,33 @@
         <DCC_N>false</DCC_N>
         <DCC_S>false</DCC_S>
         <DCC_ImageBase>00400000</DCC_ImageBase>
-        <SanitizedProjectName>SSLPublicBroker</SanitizedProjectName>
-        <VerInfo_Locale>1040</VerInfo_Locale>
-        <VerInfo_Keys>CompanyName=;FileDescription=;FileVersion=1.0.0.0;InternalName=;LegalCopyright=;LegalTrademarks=;OriginalFilename=;ProductName=;ProductVersion=1.0.0.0;Comments=;CFBundleName=</VerInfo_Keys>
-        <DCC_Namespace>System;Xml;Data;Datasnap;Web;Soap;$(DCC_Namespace)</DCC_Namespace>
-        <DCC_UnitSearchPath>..\..\src;$(DCC_UnitSearchPath)</DCC_UnitSearchPath>
-        <Icon_MainIcon>$(BDS)\bin\delphi_PROJECTICON.ico</Icon_MainIcon>
-        <Icns_MainIcns>$(BDS)\bin\delphi_PROJECTICNS.icns</Icns_MainIcns>
+        <SanitizedProjectName>{project_name}</SanitizedProjectName>
+        <VerInfo_Locale>1033</VerInfo_Locale>
+        <DCC_Namespace>{ns_prefix}System;Xml;Data;Datasnap;Web;Soap;$(DCC_Namespace)</DCC_Namespace>{search_xml}
     </PropertyGroup>
     <PropertyGroup Condition="'$(Base_Win32)'!=''">
-        <DCC_Namespace>Winapi;System.Win;Data.Win;Datasnap.Win;Web.Win;Soap.Win;Xml.Win;Bde;$(DCC_Namespace)</DCC_Namespace>
+        <DCC_Namespace>Winapi;System.Win;Data.Win;Datasnap.Win;Web.Win;Soap.Win;Xml.Win;$(DCC_Namespace)</DCC_Namespace>
         <BT_BuildType>Debug</BT_BuildType>
-        <VerInfo_Keys>CompanyName=;FileDescription=$(MSBuildProjectName);FileVersion=1.0.0.0;InternalName=;LegalCopyright=;LegalTrademarks=;OriginalFilename=;ProgramID=com.embarcadero.$(MSBuildProjectName);ProductName=$(MSBuildProjectName);ProductVersion=1.0.0.0;Comments=</VerInfo_Keys>
-        <VerInfo_Locale>1033</VerInfo_Locale>
     </PropertyGroup>
     <PropertyGroup Condition="'$(Base_Win64)'!=''">
         <DCC_Namespace>Winapi;System.Win;Data.Win;Datasnap.Win;Web.Win;Soap.Win;Xml.Win;$(DCC_Namespace)</DCC_Namespace>
         <BT_BuildType>Debug</BT_BuildType>
-        <VerInfo_Keys>CompanyName=;FileDescription=$(MSBuildProjectName);FileVersion=1.0.0.0;InternalName=;LegalCopyright=;LegalTrademarks=;OriginalFilename=;ProgramID=com.embarcadero.$(MSBuildProjectName);ProductName=$(MSBuildProjectName);ProductVersion=1.0.0.0;Comments=</VerInfo_Keys>
-        <VerInfo_Locale>1033</VerInfo_Locale>
     </PropertyGroup>
     <PropertyGroup Condition="'$(Cfg_1)'!=''">
         <DCC_Define>RELEASE;$(DCC_Define)</DCC_Define>
         <DCC_DebugInformation>0</DCC_DebugInformation>
         <DCC_LocalDebugSymbols>false</DCC_LocalDebugSymbols>
-        <DCC_SymbolReferenceInfo>0</DCC_SymbolReferenceInfo>
     </PropertyGroup>
     <PropertyGroup Condition="'$(Cfg_2)'!=''">
         <DCC_Define>DEBUG;$(DCC_Define)</DCC_Define>
         <DCC_Optimize>false</DCC_Optimize>
         <DCC_GenerateStackFrames>true</DCC_GenerateStackFrames>
-        <DCC_RangeChecking>true</DCC_RangeChecking>
-        <DCC_IntegerOverflowCheck>true</DCC_IntegerOverflowCheck>
     </PropertyGroup>
     <ItemGroup>
         <DelphiCompile Include="$(MainSource)">
             <MainSource>MainSource</MainSource>
         </DelphiCompile>
-        <DCCReference Include="..\..\src\MQTT.Types.pas"/>
-        <DCCReference Include="..\..\src\MQTT.Protocol.pas"/>
-        <DCCReference Include="..\..\src\MQTT.Logger.pas"/>
-        <DCCReference Include="..\..\src\MQTT.Client.pas"/>
+{refs_xml}
         <BuildConfiguration Include="Base">
             <Key>Base</Key>
         </BuildConfiguration>
@@ -101,7 +124,7 @@
         <BorlandProject>
             <Delphi.Personality>
                 <Source>
-                    <Source Name="MainSource">SSLPublicBroker.dpr</Source>
+                    <Source Name="MainSource">{main_source}</Source>
                 </Source>
             </Delphi.Personality>
             <Platforms>
@@ -111,6 +134,6 @@
         </BorlandProject>
         <ProjectFileVersion>12</ProjectFileVersion>
     </ProjectExtensions>
-    <Import Project="$(BDS)\Bin\CodeGear.Delphi.Targets" Condition="Exists('$(BDS)\Bin\CodeGear.Delphi.Targets')"/>
-    <Import Project="$(APPDATA)\Embarcadero\$(BDSAPPDATABASEDIR)\$(PRODUCTVERSION)\UserTools.proj" Condition="Exists('$(APPDATA)\Embarcadero\$(BDSAPPDATABASEDIR)\$(PRODUCTVERSION)\UserTools.proj')"/>
+    <Import Project="$(BDS)\\Bin\\CodeGear.Delphi.Targets" Condition="Exists('$(BDS)\\Bin\\CodeGear.Delphi.Targets')"/>
 </Project>
+"""

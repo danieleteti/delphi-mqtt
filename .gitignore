@@ -20,3 +20,5 @@ tests/dunitx-results.xml
 scripts/cross-protocol-tests/*.exe
 scripts/cross-protocol-tests/node_modules/
 scripts/cross-protocol-tests/package*.json
+samples/13_LoggerPro/logs/
+scripts/__pycache__/

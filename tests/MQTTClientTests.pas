@@ -399,47 +399,45 @@ end;
 procedure TMQTTClientTests.Logger_CapturesConnectMessage;
 var
   Client: IMQTTClient;
-  TempFile: string;
-  Content: string;
-  Stream: TFileStream;
-  Bytes: TBytes;
+  Captured: TStringList;
+  CaptureLock: TCriticalSection;
+  AllText: string;
 begin
   RequireBroker;
-  // Use a guaranteed-unique path (GUID) to avoid collisions across reruns
-  TempFile := IncludeTrailingPathDelimiter(GetEnvironmentVariable('TEMP')) +
-    'mqtt-cli-' + TGUID.NewGuid.ToString.Replace('{','').Replace('}','').Replace('-','') + '.log';
-
+  Captured := TStringList.Create;
+  CaptureLock := TCriticalSection.Create;
   try
     Client := CreateMQTTClient;
-    Client.Logger := CreateFileLogger(TempFile, False, llDebug);
+    Client.Logger := CreateProcLogger(
+      procedure(Level: TMQTTLogLevel; const Msg: string)
+      begin
+        CaptureLock.Enter;
+        try
+          Captured.Add(Format('[%s] %s', [LogLevelName(Level), Msg]));
+        finally
+          CaptureLock.Leave;
+        end;
+      end,
+      llDebug);
+
     Client.Connect(FBrokerHost, FBrokerPort, MakeOptions(NewClientID));
-    Sleep(300);
+    Sleep(200);
     Client.Disconnect;
-    Client.Logger := CreateNullLogger; // release file logger
-    Client := nil;                     // release client
-    Sleep(100);                        // let interface refs settle
 
-    Assert.IsTrue(FileExists(TempFile), 'log file not created');
-
-    // Read with explicit share-read access
-    Stream := TFileStream.Create(TempFile, fmOpenRead or fmShareDenyNone);
+    CaptureLock.Enter;
     try
-      SetLength(Bytes, Stream.Size);
-      if Stream.Size > 0 then
-        Stream.ReadBuffer(Bytes, Stream.Size);
+      AllText := Captured.Text;
     finally
-      Stream.Free;
+      CaptureLock.Leave;
     end;
-    Content := TEncoding.UTF8.GetString(Bytes);
 
-    Assert.IsTrue(Content.Contains('Connected'), 'log missing Connected entry');
-    Assert.IsTrue(Content.Contains('CONNECT'), 'log missing CONNECT packet entry');
+    Assert.IsTrue(AllText.Contains('Connected'),
+      'logger never received a "Connected" entry. Captured: ' + AllText);
+    Assert.IsTrue(AllText.Contains('CONNECT'),
+      'logger never received a "CONNECT" packet entry. Captured: ' + AllText);
   finally
-    if FileExists(TempFile) then
-      try
-        DeleteFile(TempFile);
-      except
-      end;
+    CaptureLock.Free;
+    Captured.Free;
   end;
 end;
 

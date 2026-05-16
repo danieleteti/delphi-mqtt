@@ -176,7 +176,7 @@ begin
 
     try
       Client := CreateMQTTClient;
-      Client.Logger := CreateConsoleLogger(llWarning); // keep console clean
+      Client.Logger := CreateNullLogger; // silence MQTT internals; chat output owns stdout
 
       Options.SetDefaults;
       Options.ClientID := 'delphi-' + UserName + '-' + IntToStr(Random(100000));

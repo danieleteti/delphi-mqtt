@@ -1,11 +1,32 @@
 unit MQTT.Logger;
 
+(*
+  Minimal logging contract for the Delphi MQTT client.
+
+  The library core depends only on IMQTTLogger so it stays free of any
+  external logging framework. Two trivial implementations ship in this unit:
+
+    * TMQTTNullLogger - the default, swallows everything (zero overhead).
+    * TMQTTProcLogger - forwards each call to a user-supplied procedure.
+                        Use it from sample code to demonstrate the interface
+                        without pulling in a real logger.
+
+  For real applications, plug a production-grade logger via an adapter.
+  A ready-made adapter for LoggerPro (https://github.com/danieleteti/loggerpro)
+  is provided in the separate unit MQTT.Logger.LoggerPro.pas.
+
+  Why no built-in Console / File logger?
+  Real-world Delphi codebases already have a logging library (LoggerPro,
+  CodeSiteLogging, log4d, ...). Rolling our own would be a synchronous
+  reinvention that competes with the user's existing infrastructure. The
+  IMQTTLogger interface is intentionally tiny so any backend can adapt to it
+  in a few lines of code.
+*)
+
 interface
 
 uses
-  System.SysUtils,
-  System.Classes,
-  System.SyncObjs;
+  System.SysUtils;
 
 type
   TMQTTLogLevel = (llDebug, llInfo, llWarning, llError, llNone);
@@ -25,15 +46,14 @@ type
     property MinLevel: TMQTTLogLevel read GetMinLevel write SetMinLevel;
   end;
 
-  TMQTTLoggerBase = class abstract(TInterfacedObject, IMQTTLogger)
+  TMQTTLogProc = reference to procedure(Level: TMQTTLogLevel; const Msg: string);
+
+  // No-op implementation. Default when no logger is set on the client.
+  TMQTTNullLogger = class(TInterfacedObject, IMQTTLogger)
   private
     FMinLevel: TMQTTLogLevel;
-  protected
-    procedure WriteLog(Level: TMQTTLogLevel; const Msg: string); virtual; abstract;
-    function FormatLine(Level: TMQTTLogLevel; const Msg: string): string;
-    function LevelLabel(Level: TMQTTLogLevel): string;
   public
-    constructor Create(AMinLevel: TMQTTLogLevel = llInfo);
+    constructor Create;
     procedure Debug(const Msg: string); overload;
     procedure Debug(const Fmt: string; const Args: array of const); overload;
     procedure Info(const Msg: string); overload;
@@ -46,234 +66,153 @@ type
     procedure SetMinLevel(Level: TMQTTLogLevel);
   end;
 
-  TMQTTNullLogger = class(TMQTTLoggerBase)
-  protected
-    procedure WriteLog(Level: TMQTTLogLevel; const Msg: string); override;
-  end;
-
-  TMQTTConsoleLogger = class(TMQTTLoggerBase)
+  // Trivial inline adapter: every call (filtered by MinLevel) is forwarded
+  // to a user-supplied procedure. Handy for samples and tests.
+  TMQTTProcLogger = class(TInterfacedObject, IMQTTLogger)
   private
-    FLock: TCriticalSection;
-  protected
-    procedure WriteLog(Level: TMQTTLogLevel; const Msg: string); override;
+    FProc: TMQTTLogProc;
+    FMinLevel: TMQTTLogLevel;
+    procedure Emit(Level: TMQTTLogLevel; const Msg: string);
   public
-    constructor Create(AMinLevel: TMQTTLogLevel = llInfo);
-    destructor Destroy; override;
+    constructor Create(const Proc: TMQTTLogProc; MinLevel: TMQTTLogLevel = llInfo);
+    procedure Debug(const Msg: string); overload;
+    procedure Debug(const Fmt: string; const Args: array of const); overload;
+    procedure Info(const Msg: string); overload;
+    procedure Info(const Fmt: string; const Args: array of const); overload;
+    procedure Warning(const Msg: string); overload;
+    procedure Warning(const Fmt: string; const Args: array of const); overload;
+    procedure Error(const Msg: string); overload;
+    procedure Error(const Fmt: string; const Args: array of const); overload;
+    function GetMinLevel: TMQTTLogLevel;
+    procedure SetMinLevel(Level: TMQTTLogLevel);
   end;
 
-  TMQTTFileLogger = class(TMQTTLoggerBase)
-  private
-    FFileName: string;
-    FStream: TFileStream;
-    FLock: TCriticalSection;
-    FAppend: Boolean;
-    procedure OpenStream;
-  protected
-    procedure WriteLog(Level: TMQTTLogLevel; const Msg: string); override;
-  public
-    constructor Create(const AFileName: string; AAppend: Boolean = True;
-      AMinLevel: TMQTTLogLevel = llInfo);
-    destructor Destroy; override;
-    property FileName: string read FFileName;
-  end;
-
-function CreateConsoleLogger(MinLevel: TMQTTLogLevel = llInfo): IMQTTLogger;
-function CreateFileLogger(const FileName: string; Append: Boolean = True;
-  MinLevel: TMQTTLogLevel = llInfo): IMQTTLogger;
 function CreateNullLogger: IMQTTLogger;
+function CreateProcLogger(const Proc: TMQTTLogProc;
+  MinLevel: TMQTTLogLevel = llInfo): IMQTTLogger;
+function LogLevelName(Level: TMQTTLogLevel): string;
 
 implementation
 
-uses
-  System.DateUtils;
-
-function CreateConsoleLogger(MinLevel: TMQTTLogLevel): IMQTTLogger;
-begin
-  Result := TMQTTConsoleLogger.Create(MinLevel);
-end;
-
-function CreateFileLogger(const FileName: string; Append: Boolean;
-  MinLevel: TMQTTLogLevel): IMQTTLogger;
-begin
-  Result := TMQTTFileLogger.Create(FileName, Append, MinLevel);
-end;
-
 function CreateNullLogger: IMQTTLogger;
 begin
-  Result := TMQTTNullLogger.Create(llNone);
+  Result := TMQTTNullLogger.Create;
 end;
 
-{ TMQTTLoggerBase }
-
-constructor TMQTTLoggerBase.Create(AMinLevel: TMQTTLogLevel);
+function CreateProcLogger(const Proc: TMQTTLogProc; MinLevel: TMQTTLogLevel): IMQTTLogger;
 begin
-  inherited Create;
-  FMinLevel := AMinLevel;
+  Result := TMQTTProcLogger.Create(Proc, MinLevel);
 end;
 
-function TMQTTLoggerBase.LevelLabel(Level: TMQTTLogLevel): string;
+function LogLevelName(Level: TMQTTLogLevel): string;
 begin
   case Level of
     llDebug:   Result := 'DEBUG';
-    llInfo:    Result := 'INFO ';
-    llWarning: Result := 'WARN ';
+    llInfo:    Result := 'INFO';
+    llWarning: Result := 'WARN';
     llError:   Result := 'ERROR';
+    llNone:    Result := 'NONE';
   else
-    Result := '?????';
+    Result := '?';
   end;
-end;
-
-function TMQTTLoggerBase.FormatLine(Level: TMQTTLogLevel; const Msg: string): string;
-begin
-  Result := Format('[%s] [%s] %s',
-    [FormatDateTime('yyyy-mm-dd hh:nn:ss.zzz', Now), LevelLabel(Level), Msg]);
-end;
-
-function TMQTTLoggerBase.GetMinLevel: TMQTTLogLevel;
-begin
-  Result := FMinLevel;
-end;
-
-procedure TMQTTLoggerBase.SetMinLevel(Level: TMQTTLogLevel);
-begin
-  FMinLevel := Level;
-end;
-
-procedure TMQTTLoggerBase.Debug(const Msg: string);
-begin
-  if FMinLevel <= llDebug then
-    WriteLog(llDebug, Msg);
-end;
-
-procedure TMQTTLoggerBase.Debug(const Fmt: string; const Args: array of const);
-begin
-  if FMinLevel <= llDebug then
-    WriteLog(llDebug, Format(Fmt, Args));
-end;
-
-procedure TMQTTLoggerBase.Info(const Msg: string);
-begin
-  if FMinLevel <= llInfo then
-    WriteLog(llInfo, Msg);
-end;
-
-procedure TMQTTLoggerBase.Info(const Fmt: string; const Args: array of const);
-begin
-  if FMinLevel <= llInfo then
-    WriteLog(llInfo, Format(Fmt, Args));
-end;
-
-procedure TMQTTLoggerBase.Warning(const Msg: string);
-begin
-  if FMinLevel <= llWarning then
-    WriteLog(llWarning, Msg);
-end;
-
-procedure TMQTTLoggerBase.Warning(const Fmt: string; const Args: array of const);
-begin
-  if FMinLevel <= llWarning then
-    WriteLog(llWarning, Format(Fmt, Args));
-end;
-
-procedure TMQTTLoggerBase.Error(const Msg: string);
-begin
-  if FMinLevel <= llError then
-    WriteLog(llError, Msg);
-end;
-
-procedure TMQTTLoggerBase.Error(const Fmt: string; const Args: array of const);
-begin
-  if FMinLevel <= llError then
-    WriteLog(llError, Format(Fmt, Args));
 end;
 
 { TMQTTNullLogger }
 
-procedure TMQTTNullLogger.WriteLog(Level: TMQTTLogLevel; const Msg: string);
+constructor TMQTTNullLogger.Create;
 begin
-  // no-op
-end;
-
-{ TMQTTConsoleLogger }
-
-constructor TMQTTConsoleLogger.Create(AMinLevel: TMQTTLogLevel);
-begin
-  inherited Create(AMinLevel);
-  FLock := TCriticalSection.Create;
-end;
-
-destructor TMQTTConsoleLogger.Destroy;
-begin
-  FLock.Free;
   inherited;
+  FMinLevel := llNone;
 end;
 
-procedure TMQTTConsoleLogger.WriteLog(Level: TMQTTLogLevel; const Msg: string);
-var
-  Line: string;
+procedure TMQTTNullLogger.Debug(const Msg: string); begin end;
+procedure TMQTTNullLogger.Debug(const Fmt: string; const Args: array of const); begin end;
+procedure TMQTTNullLogger.Info(const Msg: string); begin end;
+procedure TMQTTNullLogger.Info(const Fmt: string; const Args: array of const); begin end;
+procedure TMQTTNullLogger.Warning(const Msg: string); begin end;
+procedure TMQTTNullLogger.Warning(const Fmt: string; const Args: array of const); begin end;
+procedure TMQTTNullLogger.Error(const Msg: string); begin end;
+procedure TMQTTNullLogger.Error(const Fmt: string; const Args: array of const); begin end;
+
+function TMQTTNullLogger.GetMinLevel: TMQTTLogLevel;
 begin
-  Line := FormatLine(Level, Msg);
-  FLock.Enter;
-  try
-    if IsConsole then
-      Writeln(Line);
-  finally
-    FLock.Leave;
-  end;
+  Result := FMinLevel;
 end;
 
-{ TMQTTFileLogger }
-
-constructor TMQTTFileLogger.Create(const AFileName: string; AAppend: Boolean;
-  AMinLevel: TMQTTLogLevel);
+procedure TMQTTNullLogger.SetMinLevel(Level: TMQTTLogLevel);
 begin
-  inherited Create(AMinLevel);
-  FFileName := AFileName;
-  FAppend := AAppend;
-  FLock := TCriticalSection.Create;
-  OpenStream;
+  FMinLevel := Level;
 end;
 
-destructor TMQTTFileLogger.Destroy;
+{ TMQTTProcLogger }
+
+constructor TMQTTProcLogger.Create(const Proc: TMQTTLogProc; MinLevel: TMQTTLogLevel);
 begin
-  FreeAndNil(FStream);
-  FLock.Free;
-  inherited;
+  inherited Create;
+  FProc := Proc;
+  FMinLevel := MinLevel;
 end;
 
-procedure TMQTTFileLogger.OpenStream;
-var
-  Mode: Word;
+procedure TMQTTProcLogger.Emit(Level: TMQTTLogLevel; const Msg: string);
 begin
-  if FAppend and FileExists(FFileName) then
+  if (FMinLevel <= Level) and Assigned(FProc) then
   begin
-    FStream := TFileStream.Create(FFileName, fmOpenWrite or fmShareDenyWrite);
-    FStream.Seek(0, soEnd);
-  end
-  else
-  begin
-    Mode := fmCreate or fmShareDenyWrite;
-    FStream := TFileStream.Create(FFileName, Mode);
-  end;
-end;
-
-procedure TMQTTFileLogger.WriteLog(Level: TMQTTLogLevel; const Msg: string);
-var
-  Line: string;
-  Bytes: TBytes;
-begin
-  Line := FormatLine(Level, Msg) + sLineBreak;
-  Bytes := TEncoding.UTF8.GetBytes(Line);
-
-  FLock.Enter;
-  try
-    if Assigned(FStream) then
-    begin
-      FStream.WriteBuffer(Bytes, Length(Bytes));
+    try
+      FProc(Level, Msg);
+    except
+      // never propagate logger exceptions back to the MQTT client
     end;
-  finally
-    FLock.Leave;
   end;
+end;
+
+procedure TMQTTProcLogger.Debug(const Msg: string);
+begin
+  Emit(llDebug, Msg);
+end;
+
+procedure TMQTTProcLogger.Debug(const Fmt: string; const Args: array of const);
+begin
+  Emit(llDebug, Format(Fmt, Args));
+end;
+
+procedure TMQTTProcLogger.Info(const Msg: string);
+begin
+  Emit(llInfo, Msg);
+end;
+
+procedure TMQTTProcLogger.Info(const Fmt: string; const Args: array of const);
+begin
+  Emit(llInfo, Format(Fmt, Args));
+end;
+
+procedure TMQTTProcLogger.Warning(const Msg: string);
+begin
+  Emit(llWarning, Msg);
+end;
+
+procedure TMQTTProcLogger.Warning(const Fmt: string; const Args: array of const);
+begin
+  Emit(llWarning, Format(Fmt, Args));
+end;
+
+procedure TMQTTProcLogger.Error(const Msg: string);
+begin
+  Emit(llError, Msg);
+end;
+
+procedure TMQTTProcLogger.Error(const Fmt: string; const Args: array of const);
+begin
+  Emit(llError, Format(Fmt, Args));
+end;
+
+function TMQTTProcLogger.GetMinLevel: TMQTTLogLevel;
+begin
+  Result := FMinLevel;
+end;
+
+procedure TMQTTProcLogger.SetMinLevel(Level: TMQTTLogLevel);
+begin
+  FMinLevel := Level;
 end;
 
 end.

@@ -46,6 +46,7 @@
         <VerInfo_Locale>1040</VerInfo_Locale>
         <VerInfo_Keys>CompanyName=;FileDescription=;FileVersion=1.0.0.0;InternalName=;LegalCopyright=;LegalTrademarks=;OriginalFilename=;ProductName=;ProductVersion=1.0.0.0;Comments=;CFBundleName=</VerInfo_Keys>
         <DCC_Namespace>System;Xml;Data;Datasnap;Web;Soap;$(DCC_Namespace)</DCC_Namespace>
+        <DCC_UnitSearchPath>..\..\src;$(DCC_UnitSearchPath)</DCC_UnitSearchPath>
         <Icon_MainIcon>$(BDS)\bin\delphi_PROJECTICON.ico</Icon_MainIcon>
         <Icns_MainIcns>$(BDS)\bin\delphi_PROJECTICNS.icns</Icns_MainIcns>
     </PropertyGroup>
@@ -80,6 +81,7 @@
         </DelphiCompile>
         <DCCReference Include="..\..\src\MQTT.Types.pas"/>
         <DCCReference Include="..\..\src\MQTT.Protocol.pas"/>
+        <DCCReference Include="..\..\src\MQTT.Logger.pas"/>
         <DCCReference Include="..\..\src\MQTT.Client.pas"/>
         <BuildConfiguration Include="Base">
             <Key>Base</Key>
