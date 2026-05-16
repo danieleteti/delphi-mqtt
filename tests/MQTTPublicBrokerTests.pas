@@ -20,15 +20,20 @@ type
     SSLPort: Word;
   end;
 
+  TBrokerOutcome = (boOK, boSkipNetwork, boFailProtocol);
+
   [TestFixture]
   TMQTTPublicBrokerTests = class
   private
     function MakeOptions(const ClientID: string): TMQTTConnectOptions;
     function NewClientID(const Prefix: string): string;
     function IsHostReachable(const Host: string; Port: Word): Boolean;
-    function RunPlainPubSubAgainst(const Broker: TPublicBroker; out FailReason: string): Boolean;
-    function RunSSLConnectAgainst(const Broker: TPublicBroker; out FailReason: string): Boolean;
+    function RunPlainPubSubAgainst(const Broker: TPublicBroker; out FailReason: string): TBrokerOutcome;
+    function RunSSLConnectAgainst(const Broker: TPublicBroker; out FailReason: string): TBrokerOutcome;
     function OpenSSLAvailable: Boolean;
+    function IsNetworkErrorMessage(const Msg: string): Boolean;
+    procedure AssertPlainPubSub(const Broker: TPublicBroker);
+    procedure AssertSSLConnect(const Broker: TPublicBroker);
   public
     [Test]
     procedure Mosquitto_Plain_PubSub;
@@ -110,21 +115,49 @@ end;
 function TMQTTPublicBrokerTests.OpenSSLAvailable: Boolean;
 var
   ExeDir: string;
+  HLib1, HLib2: HMODULE;
 begin
   ExeDir := ExtractFilePath(ParamStr(0));
   Result := FileExists(ExeDir + 'libeay32.dll') and FileExists(ExeDir + 'ssleay32.dll');
-  if not Result then
-    // also try system path
-    Result := (LoadLibrary('libeay32.dll') <> 0) and (LoadLibrary('ssleay32.dll') <> 0);
+  if Result then
+    Exit;
+
+  // Fall back to a system-PATH search but immediately release any handles
+  // we acquired so this probe doesn't leak DLL refs on every run.
+  HLib1 := LoadLibrary('libeay32.dll');
+  HLib2 := LoadLibrary('ssleay32.dll');
+  Result := (HLib1 <> 0) and (HLib2 <> 0);
+  if HLib1 <> 0 then FreeLibrary(HLib1);
+  if HLib2 <> 0 then FreeLibrary(HLib2);
 end;
 
-function TMQTTPublicBrokerTests.RunPlainPubSubAgainst(const Broker: TPublicBroker; out FailReason: string): Boolean;
+function TMQTTPublicBrokerTests.IsNetworkErrorMessage(const Msg: string): Boolean;
+const
+  NETWORK_KEYWORDS: array[0..6] of string = (
+    'connection refused',
+    'no route to host',
+    'host is down',
+    'connection reset',
+    'timed out',
+    'no connack',
+    'EIdSocket'
+  );
+var
+  Lower, Keyword: string;
+begin
+  Lower := LowerCase(Msg);
+  for Keyword in NETWORK_KEYWORDS do
+    if Pos(LowerCase(Keyword), Lower) > 0 then
+      Exit(True);
+  Result := False;
+end;
+
+function TMQTTPublicBrokerTests.RunPlainPubSubAgainst(const Broker: TPublicBroker; out FailReason: string): TBrokerOutcome;
 var
   Sub, Pub: IMQTTClient;
   GotEvent: TEvent;
   Topic, Payload, Received: string;
 begin
-  Result := False;
   FailReason := '';
   Topic := Format('dunit/public/%s/%d',
     [StringReplace(Broker.Name, '.', '_', [rfReplaceAll]), Random(1000000)]);
@@ -139,7 +172,10 @@ begin
       on E: Exception do
       begin
         FailReason := 'subscriber connect: ' + E.Message;
-        Exit(False);
+        if IsNetworkErrorMessage(E.Message) then
+          Exit(boSkipNetwork)
+        else
+          Exit(boFailProtocol);
       end;
     end;
 
@@ -150,7 +186,10 @@ begin
       begin
         FailReason := 'publisher connect: ' + E.Message;
         Sub.Disconnect;
-        Exit(False);
+        if IsNetworkErrorMessage(E.Message) then
+          Exit(boSkipNetwork)
+        else
+          Exit(boFailProtocol);
       end;
     end;
 
@@ -168,12 +207,21 @@ begin
 
       if GotEvent.WaitFor(10000) = wrSignaled then
       begin
-        Result := Received = Payload;
-        if not Result then
+        if Received = Payload then
+          Result := boOK
+        else
+        begin
           FailReason := Format('payload mismatch: expected "%s" got "%s"', [Payload, Received]);
+          Result := boFailProtocol;
+        end;
       end
       else
+      begin
+        // Both ends connected over MQTT but the round-trip timed out.
+        // That's a flaky public service, not a client bug -> skip.
         FailReason := 'timeout waiting for published message round-trip';
+        Result := boSkipNetwork;
+      end;
     finally
       Pub.Disconnect;
       Sub.Disconnect;
@@ -183,12 +231,11 @@ begin
   end;
 end;
 
-function TMQTTPublicBrokerTests.RunSSLConnectAgainst(const Broker: TPublicBroker; out FailReason: string): Boolean;
+function TMQTTPublicBrokerTests.RunSSLConnectAgainst(const Broker: TPublicBroker; out FailReason: string): TBrokerOutcome;
 var
   Client: IMQTTClient;
   SSLOpts: TMQTTSSLOptions;
 begin
-  Result := False;
   FailReason := '';
   Client := CreateMQTTClient;
   SSLOpts.SetDefaults;
@@ -197,81 +244,95 @@ begin
   SSLOpts.VerifyMode := sslVerifyNone;
   try
     Client.Connect(Broker.Host, Broker.SSLPort, MakeOptions(NewClientID('ssl')), SSLOpts);
-    Result := Client.Connected;
-    if not Result then
+    if Client.Connected then
+      Result := boOK
+    else
+    begin
       FailReason := 'connect returned but Connected=False';
+      Result := boFailProtocol;
+    end;
     Client.Disconnect;
   except
     on E: Exception do
     begin
-      Result := False;
       FailReason := E.ClassName + ': ' + E.Message;
+      if IsNetworkErrorMessage(E.Message) then
+        Result := boSkipNetwork
+      else
+        Result := boFailProtocol;
     end;
   end;
 end;
 
-procedure TMQTTPublicBrokerTests.Mosquitto_Plain_PubSub;
+procedure TMQTTPublicBrokerTests.AssertPlainPubSub(const Broker: TPublicBroker);
 var
   Reason: string;
+  Outcome: TBrokerOutcome;
 begin
-  if not IsHostReachable(MOSQUITTO.Host, MOSQUITTO.PlainPort) then
+  if not IsHostReachable(Broker.Host, Broker.PlainPort) then
     Assert.Pass(Format('Skipped: %s:%d unreachable from this network',
-      [MOSQUITTO.Host, MOSQUITTO.PlainPort]));
-  if not RunPlainPubSubAgainst(MOSQUITTO, Reason) then
-    Assert.Pass(Format('Skipped: %s reachable but round-trip failed: %s',
-      [MOSQUITTO.Name, Reason]));
+      [Broker.Host, Broker.PlainPort]));
+
+  Outcome := RunPlainPubSubAgainst(Broker, Reason);
+  case Outcome of
+    boOK:
+      ; // implicit pass
+    boSkipNetwork:
+      Assert.Pass(Format('Skipped (network/instability): %s - %s',
+        [Broker.Name, Reason]));
+    boFailProtocol:
+      Assert.Fail(Format('Protocol failure against %s: %s',
+        [Broker.Name, Reason]));
+  end;
 end;
 
-procedure TMQTTPublicBrokerTests.Mosquitto_SSL_Connect;
+procedure TMQTTPublicBrokerTests.AssertSSLConnect(const Broker: TPublicBroker);
 var
   Reason: string;
+  Outcome: TBrokerOutcome;
 begin
   if not OpenSSLAvailable then
     Assert.Pass('Skipped: OpenSSL 1.0.2 DLLs (libeay32.dll, ssleay32.dll) not found');
-  if not IsHostReachable(MOSQUITTO.Host, MOSQUITTO.SSLPort) then
+  if not IsHostReachable(Broker.Host, Broker.SSLPort) then
     Assert.Pass(Format('Skipped: %s:%d unreachable from this network',
-      [MOSQUITTO.Host, MOSQUITTO.SSLPort]));
-  if not RunSSLConnectAgainst(MOSQUITTO, Reason) then
-    Assert.Pass(Format('Skipped: %s SSL reachable but handshake failed: %s',
-      [MOSQUITTO.Name, Reason]));
+      [Broker.Host, Broker.SSLPort]));
+
+  Outcome := RunSSLConnectAgainst(Broker, Reason);
+  case Outcome of
+    boOK:
+      ; // implicit pass
+    boSkipNetwork:
+      Assert.Pass(Format('Skipped (network/instability): %s SSL - %s',
+        [Broker.Name, Reason]));
+    boFailProtocol:
+      Assert.Fail(Format('SSL/protocol failure against %s: %s',
+        [Broker.Name, Reason]));
+  end;
+end;
+
+procedure TMQTTPublicBrokerTests.Mosquitto_Plain_PubSub;
+begin
+  AssertPlainPubSub(MOSQUITTO);
+end;
+
+procedure TMQTTPublicBrokerTests.Mosquitto_SSL_Connect;
+begin
+  AssertSSLConnect(MOSQUITTO);
 end;
 
 procedure TMQTTPublicBrokerTests.HiveMQ_Plain_PubSub;
-var
-  Reason: string;
 begin
-  if not IsHostReachable(HIVEMQ.Host, HIVEMQ.PlainPort) then
-    Assert.Pass(Format('Skipped: %s:%d unreachable from this network',
-      [HIVEMQ.Host, HIVEMQ.PlainPort]));
-  if not RunPlainPubSubAgainst(HIVEMQ, Reason) then
-    Assert.Pass(Format('Skipped: %s reachable but round-trip failed: %s',
-      [HIVEMQ.Name, Reason]));
+  AssertPlainPubSub(HIVEMQ);
 end;
 
 procedure TMQTTPublicBrokerTests.HiveMQ_SSL_Connect;
-var
-  Reason: string;
 begin
-  if not OpenSSLAvailable then
-    Assert.Pass('Skipped: OpenSSL 1.0.2 DLLs not found');
-  if not IsHostReachable(HIVEMQ.Host, HIVEMQ.SSLPort) then
-    Assert.Pass(Format('Skipped: %s:%d unreachable from this network',
-      [HIVEMQ.Host, HIVEMQ.SSLPort]));
-  if not RunSSLConnectAgainst(HIVEMQ, Reason) then
-    Assert.Pass(Format('Skipped: %s SSL reachable but handshake failed: %s',
-      [HIVEMQ.Name, Reason]));
+  AssertSSLConnect(HIVEMQ);
 end;
 
 procedure TMQTTPublicBrokerTests.EMQX_Plain_PubSub;
-var
-  Reason: string;
 begin
-  if not IsHostReachable(EMQX.Host, EMQX.PlainPort) then
-    Assert.Pass(Format('Skipped: %s:%d unreachable from this network',
-      [EMQX.Host, EMQX.PlainPort]));
-  if not RunPlainPubSubAgainst(EMQX, Reason) then
-    Assert.Pass(Format('Skipped: %s reachable but round-trip failed: %s',
-      [EMQX.Name, Reason]));
+  AssertPlainPubSub(EMQX);
 end;
 
 initialization
