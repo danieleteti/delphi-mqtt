@@ -563,7 +563,8 @@ delphimqtt/
 │   │   ├── SSLPublicBroker.dpr   # Connect to public SSL brokers
 │   │   ├── SSLClientCert.dpr     # Mutual TLS with client certs
 │   │   └── TestAllBrokers.dpr    # Test all public SSL brokers
-│   └── 11_Logging/          # Logger + packet monitoring + SUBACK event
+│   ├── 11_Logging/          # Logger + packet monitoring + SUBACK event
+│   └── 12_WebChat/          # Delphi (TCP) <-> 2 browser pages (WebSocket)
 ├── tests/
 │   ├── MqttTests.dpr               # DUnitX runner
 │   ├── MQTTProtocolTests.pas       # Protocol unit tests (no broker)

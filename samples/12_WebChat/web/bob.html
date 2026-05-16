@@ -1,0 +1,70 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>WebChat - Bob</title>
+  <link rel="stylesheet" href="style.css">
+  <script src="https://unpkg.com/mqtt@5.10.1/dist/mqtt.min.js"></script>
+</head>
+<body>
+  <header>
+    <h1>WebChat <span class="bob">bob</span></h1>
+    <span id="status">connecting…</span>
+  </header>
+
+  <div id="log"></div>
+
+  <form id="composer" autocomplete="off">
+    <input type="text" id="msg" placeholder="Type a message and hit Enter" autofocus>
+    <button type="submit">Send</button>
+  </form>
+
+  <script type="module">
+    import { startChat } from "./chat.js";
+
+    const USER = "bob";
+    const SELF_CLASS = "bob";
+    const log = document.getElementById("log");
+    const status = document.getElementById("status");
+
+    const ui = {
+      status: (s) => { status.textContent = s; },
+      message: ({ from, text, ts, self }) => {
+        const row = document.createElement("div");
+        const klass = self ? `self ${SELF_CLASS}` : from;
+        row.className = `row ${klass}`;
+        row.innerHTML =
+          `<span class="ts">${ts ? ts.split("T")[1]?.slice(0,8) : ""}</span>` +
+          `<span class="from">${from}:</span>` +
+          `<span class="text"></span>`;
+        row.querySelector(".text").textContent = text;
+        log.appendChild(row);
+        log.scrollTop = log.scrollHeight;
+      },
+      presence: (s) => {
+        const row = document.createElement("div");
+        row.className = "row presence";
+        row.textContent = `· ${s}`;
+        log.appendChild(row);
+        log.scrollTop = log.scrollHeight;
+      },
+    };
+
+    const chat = startChat({
+      user: USER,
+      brokerUrl: "ws://localhost:9001/mqtt",
+      ui,
+    });
+
+    const form = document.getElementById("composer");
+    const input = document.getElementById("msg");
+    form.addEventListener("submit", (e) => {
+      e.preventDefault();
+      const text = input.value.trim();
+      if (!text) return;
+      chat.publishChat(text);
+      input.value = "";
+    });
+  </script>
+</body>
+</html>
