@@ -66,6 +66,16 @@ type
     procedure RestoreSubscriptionHandler_DoesNotSendSubscribeOnWire;
     [Test]
     procedure RestoreSubscriptionHandler_DispatchesQueuedMessagesAfterSessionRestore;
+    [Test]
+    procedure ReconnectParams_DefaultsAreSane;
+    [Test]
+    procedure ReconnectParams_SettersAccept_GettersReturn;
+    [Test]
+    procedure ReconnectInitialDelayMs_Rejects_NonPositive;
+    [Test]
+    procedure ReconnectMaxDelayMs_Rejects_NonPositive;
+    [Test]
+    procedure ReconnectJitterPercent_Rejects_OutOfRange;
   end;
 
 implementation
@@ -781,6 +791,84 @@ begin
   finally
     GotEvent.Free;
   end;
+end;
+
+procedure TMQTTClientTests.ReconnectParams_DefaultsAreSane;
+var
+  Client: IMQTTClient;
+begin
+  Client := CreateMQTTClient;
+  Assert.AreEqual(1000, Client.ReconnectInitialDelayMs, 'default initial delay');
+  Assert.AreEqual(30000, Client.ReconnectMaxDelayMs, 'default max delay');
+  Assert.AreEqual(25, Client.ReconnectJitterPercent, 'default jitter percent');
+end;
+
+procedure TMQTTClientTests.ReconnectParams_SettersAccept_GettersReturn;
+var
+  Client: IMQTTClient;
+begin
+  Client := CreateMQTTClient;
+  Client.ReconnectInitialDelayMs := 250;
+  Client.ReconnectMaxDelayMs := 60000;
+  Client.ReconnectJitterPercent := 10;
+  Assert.AreEqual(250, Client.ReconnectInitialDelayMs);
+  Assert.AreEqual(60000, Client.ReconnectMaxDelayMs);
+  Assert.AreEqual(10, Client.ReconnectJitterPercent);
+
+  // Zero jitter must be accepted (disables jitter).
+  Client.ReconnectJitterPercent := 0;
+  Assert.AreEqual(0, Client.ReconnectJitterPercent);
+end;
+
+procedure TMQTTClientTests.ReconnectInitialDelayMs_Rejects_NonPositive;
+var
+  Client: IMQTTClient;
+begin
+  Client := CreateMQTTClient;
+  Assert.WillRaise(
+    procedure
+    begin
+      Client.ReconnectInitialDelayMs := 0;
+    end,
+    EMQTTException);
+  Assert.WillRaise(
+    procedure
+    begin
+      Client.ReconnectInitialDelayMs := -100;
+    end,
+    EMQTTException);
+end;
+
+procedure TMQTTClientTests.ReconnectMaxDelayMs_Rejects_NonPositive;
+var
+  Client: IMQTTClient;
+begin
+  Client := CreateMQTTClient;
+  Assert.WillRaise(
+    procedure
+    begin
+      Client.ReconnectMaxDelayMs := 0;
+    end,
+    EMQTTException);
+end;
+
+procedure TMQTTClientTests.ReconnectJitterPercent_Rejects_OutOfRange;
+var
+  Client: IMQTTClient;
+begin
+  Client := CreateMQTTClient;
+  Assert.WillRaise(
+    procedure
+    begin
+      Client.ReconnectJitterPercent := -1;
+    end,
+    EMQTTException);
+  Assert.WillRaise(
+    procedure
+    begin
+      Client.ReconnectJitterPercent := 101;
+    end,
+    EMQTTException);
 end;
 
 initialization

@@ -85,7 +85,10 @@ begin
     Writeln('connection is lost. Try stopping/starting your MQTT broker!');
     Writeln;
     Writeln('Keep-alive interval: 10 seconds');
-    Writeln('Reconnect backoff: 1s -> 2s -> 4s -> 8s -> ... -> 30s max');
+    Writeln(Format('Reconnect backoff: %d ms -> *2 each retry -> %d ms max',
+      [Client.ReconnectInitialDelayMs, Client.ReconnectMaxDelayMs]));
+    Writeln(Format('Jitter: +/-%d%% applied to every delay to avoid thundering herd',
+      [Client.ReconnectJitterPercent]));
     Writeln;
 
     // Set up event handlers BEFORE connecting
@@ -93,7 +96,11 @@ begin
     Client.SetOnDisconnect(OnDisconnect);
     Client.SetOnError(OnError);
 
-    // Enable auto-reconnect
+    // Enable auto-reconnect. Backoff parameters can be customized at any time;
+    // these are the defaults, shown here only as an example:
+    //   Client.ReconnectInitialDelayMs := 1000;
+    //   Client.ReconnectMaxDelayMs     := 30000;
+    //   Client.ReconnectJitterPercent  := 25;
     Client.AutoReconnect := True;
     Writeln('Auto-reconnect: ENABLED');
     Writeln;

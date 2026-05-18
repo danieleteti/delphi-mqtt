@@ -94,6 +94,12 @@ type
     function GetState: TMQTTConnectionState;
     procedure SetAutoReconnect(Value: Boolean);
     function GetAutoReconnect: Boolean;
+    procedure SetReconnectInitialDelayMs(Value: Integer);
+    function GetReconnectInitialDelayMs: Integer;
+    procedure SetReconnectMaxDelayMs(Value: Integer);
+    function GetReconnectMaxDelayMs: Integer;
+    procedure SetReconnectJitterPercent(Value: Integer);
+    function GetReconnectJitterPercent: Integer;
     procedure SetOnDisconnect(Handler: TMQTTDisconnectHandler); overload;
     procedure SetOnDisconnect(Handler: TMQTTDisconnectEvent); overload;
     procedure SetOnError(Handler: TMQTTErrorHandler); overload;
@@ -113,6 +119,18 @@ type
     property State: TMQTTConnectionState read GetState;
     property AutoReconnect: Boolean read GetAutoReconnect write SetAutoReconnect;
     property Logger: IMQTTLogger read GetLogger write SetLogger;
+    // Auto-reconnect backoff parameters (only relevant when AutoReconnect=True).
+    // Default backoff sequence with InitialDelay=1000, MaxDelay=30000, Jitter=25:
+    //   ~1s, ~2s, ~4s, ~8s, ~16s, then ~30s capped. Each delay is multiplied
+    //   by a random factor in [1 - JitterPercent/100, 1 + JitterPercent/100]
+    //   to avoid thundering-herd reconnects when many clients lose the broker
+    //   simultaneously. Set ReconnectJitterPercent=0 to disable jitter.
+    property ReconnectInitialDelayMs: Integer
+      read GetReconnectInitialDelayMs write SetReconnectInitialDelayMs;
+    property ReconnectMaxDelayMs: Integer
+      read GetReconnectMaxDelayMs write SetReconnectMaxDelayMs;
+    property ReconnectJitterPercent: Integer
+      read GetReconnectJitterPercent write SetReconnectJitterPercent;
     // True if the last CONNACK reported Session Present = 1
     // (broker had a persistent session for this ClientID).
     property LastSessionPresent: Boolean read GetLastSessionPresent;
@@ -139,6 +157,7 @@ type
     FAutoReconnect: Boolean;
     FReconnectDelayMs: Integer;
     FMaxReconnectDelayMs: Integer;
+    FReconnectJitterPercent: Integer;
     FOnDisconnect: TMQTTDisconnectHandler;
     FOnError: TMQTTErrorHandler;
     FOnConnect: TMQTTConnectHandler;
@@ -177,6 +196,12 @@ type
     function GetState: TMQTTConnectionState;
     procedure SetAutoReconnect(Value: Boolean);
     function GetAutoReconnect: Boolean;
+    procedure SetReconnectInitialDelayMs(Value: Integer);
+    function GetReconnectInitialDelayMs: Integer;
+    procedure SetReconnectMaxDelayMs(Value: Integer);
+    function GetReconnectMaxDelayMs: Integer;
+    procedure SetReconnectJitterPercent(Value: Integer);
+    function GetReconnectJitterPercent: Integer;
     procedure SetOnDisconnect(Handler: TMQTTDisconnectHandler); overload;
     procedure SetOnDisconnect(Handler: TMQTTDisconnectEvent); overload;
     procedure SetOnError(Handler: TMQTTErrorHandler); overload;
@@ -253,6 +278,7 @@ begin
   FAutoReconnect := False;
   FReconnectDelayMs := 1000;
   FMaxReconnectDelayMs := 30000;
+  FReconnectJitterPercent := 25;
   FShutdown := False;
   FLogger := CreateNullLogger;
   FOptions.SetDefaults;
@@ -303,6 +329,72 @@ end;
 function TMQTTClient.GetAutoReconnect: Boolean;
 begin
   Result := FAutoReconnect;
+end;
+
+procedure TMQTTClient.SetReconnectInitialDelayMs(Value: Integer);
+begin
+  if Value < 1 then
+    raise EMQTTException.Create('ReconnectInitialDelayMs must be >= 1');
+  FLock.Enter;
+  try
+    FReconnectDelayMs := Value;
+  finally
+    FLock.Leave;
+  end;
+end;
+
+function TMQTTClient.GetReconnectInitialDelayMs: Integer;
+begin
+  FLock.Enter;
+  try
+    Result := FReconnectDelayMs;
+  finally
+    FLock.Leave;
+  end;
+end;
+
+procedure TMQTTClient.SetReconnectMaxDelayMs(Value: Integer);
+begin
+  if Value < 1 then
+    raise EMQTTException.Create('ReconnectMaxDelayMs must be >= 1');
+  FLock.Enter;
+  try
+    FMaxReconnectDelayMs := Value;
+  finally
+    FLock.Leave;
+  end;
+end;
+
+function TMQTTClient.GetReconnectMaxDelayMs: Integer;
+begin
+  FLock.Enter;
+  try
+    Result := FMaxReconnectDelayMs;
+  finally
+    FLock.Leave;
+  end;
+end;
+
+procedure TMQTTClient.SetReconnectJitterPercent(Value: Integer);
+begin
+  if (Value < 0) or (Value > 100) then
+    raise EMQTTException.Create('ReconnectJitterPercent must be in 0..100');
+  FLock.Enter;
+  try
+    FReconnectJitterPercent := Value;
+  finally
+    FLock.Leave;
+  end;
+end;
+
+function TMQTTClient.GetReconnectJitterPercent: Integer;
+begin
+  FLock.Enter;
+  try
+    Result := FReconnectJitterPercent;
+  finally
+    FLock.Leave;
+  end;
 end;
 
 procedure TMQTTClient.SetOnDisconnect(Handler: TMQTTDisconnectHandler);
@@ -1363,13 +1455,14 @@ end;
 
 procedure TMQTTClient.DoReconnect;
 var
-  Delay: Integer;
+  BaseDelay, EffectiveDelay, JitterMs, JitterPct, MaxDelay: Integer;
 begin
   if FShutdown then
     Exit;
 
   FState := Reconnecting;
-  Delay := FReconnectDelayMs;
+  BaseDelay := GetReconnectInitialDelayMs;
+  MaxDelay := GetReconnectMaxDelayMs;
   SnapshotLogger.Warning('Connection lost, attempting reconnect to %s:%d', [FHost, FPort]);
 
   // Release the old pinger reference. Its loop already exited because
@@ -1387,7 +1480,26 @@ begin
 
   while not FShutdown and (FState = Reconnecting) do
   begin
-    Sleep(Delay);
+    // Apply random jitter around BaseDelay to avoid thundering-herd reconnects
+    // when many clients lose the broker simultaneously. Jitter range is
+    // +/- JitterPct% of BaseDelay; with JitterPct=0 the effective delay equals
+    // BaseDelay (jitter disabled).
+    JitterPct := GetReconnectJitterPercent;
+    if JitterPct > 0 then
+    begin
+      JitterMs := (BaseDelay * JitterPct) div 100;
+      if JitterMs < 1 then
+        JitterMs := 1;
+      EffectiveDelay := BaseDelay + (Random(JitterMs * 2 + 1) - JitterMs);
+      if EffectiveDelay < 50 then
+        EffectiveDelay := 50;
+    end
+    else
+      EffectiveDelay := BaseDelay;
+
+    SnapshotLogger.Info('Reconnect attempt in %d ms (base=%d, jitter=%d%%)',
+      [EffectiveDelay, BaseDelay, JitterPct]);
+    Sleep(EffectiveDelay);
 
     if FShutdown then
       Break;
@@ -1447,8 +1559,8 @@ begin
       // Reconnection failed, try again
     end;
 
-    // Exponential backoff
-    Delay := Min(Delay * 2, FMaxReconnectDelayMs);
+    // Exponential backoff on BaseDelay; jitter is applied per-iteration above.
+    BaseDelay := Min(BaseDelay * 2, MaxDelay);
   end;
 end;
 
