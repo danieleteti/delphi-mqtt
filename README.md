@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="docs/delphi-mqtt-logo.png" alt="Delphi MQTT" width="320">
+</p>
+
 # Delphi MQTT - MQTT Client for Delphi
 
 **Delphi MQTT** is a native MQTT 3.1.1 / 5.0 client for Embarcadero Delphi
@@ -6,9 +10,11 @@ broker (Mosquitto, HiveMQ, EMQX, AWS IoT, Azure IoT Hub) over plain TCP or
 TLS, publish and subscribe with QoS 0/1/2, react to events from a few
 lines of code.
 
-[![Version](https://img.shields.io/badge/version-1.1.0-blue.svg)](https://github.com/danieleteti/delphi-mqtt)
-[![License](https://img.shields.io/badge/license-Apache%202.0-green.svg)](LICENSE)
-[![Delphi](https://img.shields.io/badge/Delphi-10.3+-orange.svg)](https://www.embarcadero.com/products/delphi)
+<p align="center">
+  <a href="https://github.com/danieleteti/delphi-mqtt"><img src="https://img.shields.io/badge/version-1.1.0-blue.svg" alt="Version"></a>
+  <a href="LICENSE"><img src="https://img.shields.io/badge/license-Apache%202.0-green.svg" alt="License"></a>
+  <a href="https://www.embarcadero.com/products/delphi"><img src="https://img.shields.io/badge/Delphi-10.3+-orange.svg" alt="Delphi"></a>
+</p>
 
 ## What is Delphi MQTT?
 
