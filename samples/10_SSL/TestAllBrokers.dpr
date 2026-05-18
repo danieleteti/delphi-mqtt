@@ -124,10 +124,7 @@ begin
     // Wait for echo
     Write('  Waiting for echo... ');
     if MessageReceived.WaitFor(5000) = wrSignaled then
-    begin
-      Writeln('RECEIVED');
-      Result := True;
-    end
+      Writeln('RECEIVED')
     else
       Writeln('TIMEOUT (broker may be slow)');
 
@@ -136,11 +133,8 @@ begin
     Client.Disconnect;
     Writeln('OK');
 
-    // Even if no echo, connection was successful
-    if not Result and Client.Connected then
-      Result := True;
-
-    Result := True; // Connection succeeded
+    // Connection succeeded (echo is best-effort on public brokers).
+    Result := True;
 
   finally
     MessageReceived.Free;

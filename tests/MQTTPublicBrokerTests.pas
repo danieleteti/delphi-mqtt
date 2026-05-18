@@ -94,7 +94,6 @@ function TMQTTPublicBrokerTests.IsHostReachable(const Host: string; Port: Word):
 var
   Probe: TIdTCPClient;
 begin
-  Result := False;
   Probe := TIdTCPClient.Create(nil);
   try
     Probe.Host := Host;
