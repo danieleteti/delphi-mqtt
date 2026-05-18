@@ -20,8 +20,7 @@ uses
   System.SysUtils,
   System.IOUtils,
   LoggerPro,
-  LoggerPro.ConsoleAppender,
-  LoggerPro.FileAppender,
+  LoggerPro.Builder,
   MQTT.Types in '..\..\src\MQTT.Types.pas',
   MQTT.Protocol in '..\..\src\MQTT.Protocol.pas',
   MQTT.Logger in '..\..\src\MQTT.Logger.pas',
@@ -41,10 +40,14 @@ begin
     Writeln;
 
     // 1. Build a LoggerPro writer with two async appenders
-    Log := BuildLogWriter([
-      TLoggerProConsoleAppender.Create,
-      TLoggerProFileAppender.Create(5, 1000, TPath.Combine(GetCurrentDir, 'logs'))
-    ]);
+    Log := LoggerProBuilder
+            .WriteToConsole
+              .WithRenderer('ginstyle')
+              .Done
+            .WriteToFile
+              .WithLogsFolder(TPath.Combine(TPath.GetDirectoryName(GetModuleName(HInstance)), 'logs'))
+              .Done
+            .Build;
 
     // 2. Wrap it as IMQTTLogger and attach to the client
     Client := CreateMQTTClient;
