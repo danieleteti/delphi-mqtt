@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="docs/delphi-mqtt-logo.png" alt="Delphi MQTT" width="320">
+  <img src="docs/delphi-mqtt-logo.png" alt="Delphi MQTT" width="560">
 </p>
 
 # Delphi MQTT - MQTT Client for Delphi
@@ -53,24 +53,58 @@ an MQTT broker without dragging in a wrapper around a C library.
 
 ## Quick Start
 
+Self-contained console program. Save as `QuickStart.dpr`, compile with
+`dcc32 -U<path-to-src> QuickStart.dpr`, run with a broker on localhost:1883
+(e.g. Mosquitto). Subscribes to a wildcard topic, publishes a message, and
+prints the echo received from the broker via the subscription.
+
 ```pascal
-uses MQTT.Client, MQTT.Types;
+program QuickStart;
+
+{$APPTYPE CONSOLE}
+
+uses
+  System.SysUtils,
+  MQTT.Types,
+  MQTT.Client;
 
 var
   Client: IMQTTClient;
 begin
   Client := CreateMQTTClient;
-  Client.Connect('localhost', 1883);
+  try
+    // Connect (default MQTT 5, CleanStart=True, KeepAlive=60s).
+    Client.Connect('localhost', 1883);
 
-  Client.Subscribe('sensors/+/temperature',
-    procedure(const Topic: string; const Payload: TBytes)
-    begin
-      Writeln(Topic, ' = ', TEncoding.UTF8.GetString(Payload));
-    end,
-    atLeastOnce);
+    // Subscribe BEFORE publish or the broker has nowhere to route the message.
+    // The callback runs on a worker thread - keep it short and thread-safe.
+    Client.Subscribe('sensors/+/temperature',
+      procedure(const Topic: string; const Payload: TBytes)
+      begin
+        Writeln('RX <- ', Topic, ' = ', TEncoding.UTF8.GetString(Payload));
+      end,
+      atLeastOnce);
 
-  Client.Publish('sensors/kitchen/temperature', '23.5', atLeastOnce);
-end;
+    // Publish: the broker fans this out to every matching subscription,
+    // including the one above (us).
+    Client.Publish('sensors/kitchen/temperature', '23.5', atLeastOnce);
+
+    // The dispatch is asynchronous: wait a moment so the callback can fire
+    // before we tear the client down.
+    Sleep(1000);
+
+    Client.Disconnect;
+  except
+    on E: Exception do
+      Writeln('ERROR: ', E.ClassName, ': ', E.Message);
+  end;
+end.
+```
+
+Expected output:
+
+```
+RX <- sensors/kitchen/temperature = 23.5
 ```
 
 ## Documentation
