@@ -7,9 +7,9 @@ uses
   System.Generics.Collections;
 
 const
-  MQTT_LIB_VERSION = '1.0.0';
+  MQTT_LIB_VERSION = '1.1.0';
   MQTT_LIB_VERSION_MAJOR = 1;
-  MQTT_LIB_VERSION_MINOR = 0;
+  MQTT_LIB_VERSION_MINOR = 1;
   MQTT_LIB_VERSION_PATCH = 0;
 
 type

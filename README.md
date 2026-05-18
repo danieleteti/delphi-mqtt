@@ -6,7 +6,7 @@ broker (Mosquitto, HiveMQ, EMQX, AWS IoT, Azure IoT Hub) over plain TCP or
 TLS, publish and subscribe with QoS 0/1/2, react to events from a few
 lines of code.
 
-[![Version](https://img.shields.io/badge/version-1.0.0-blue.svg)](https://github.com/danieleteti/delphi-mqtt)
+[![Version](https://img.shields.io/badge/version-1.1.0-blue.svg)](https://github.com/danieleteti/delphi-mqtt)
 [![License](https://img.shields.io/badge/license-Apache%202.0-green.svg)](LICENSE)
 [![Delphi](https://img.shields.io/badge/Delphi-10.3+-orange.svg)](https://www.embarcadero.com/products/delphi)
 
