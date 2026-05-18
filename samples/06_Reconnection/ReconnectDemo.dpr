@@ -33,11 +33,11 @@ var
   ConnectCount: Integer;
   MessageCount: Integer;
 
-procedure OnConnect(ReasonCode: TMQTTReasonCode);
+procedure OnConnect(ReasonCode: TMQTTReasonCode; SessionPresent: Boolean);
 begin
   Inc(ConnectCount);
-  Writeln(Format('[%s] Connected! (connection #%d, reason: %d)',
-    [FormatDateTime('hh:nn:ss', Now), ConnectCount, Ord(ReasonCode)]));
+  Writeln(Format('[%s] Connected! (connection #%d, reason: %d, sessionPresent: %s)',
+    [FormatDateTime('hh:nn:ss', Now), ConnectCount, Ord(ReasonCode), BoolToStr(SessionPresent, True)]));
 
   // Re-subscribe after reconnection (subscriptions are not persisted)
   if Client.Connected then

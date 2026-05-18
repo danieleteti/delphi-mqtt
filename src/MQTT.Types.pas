@@ -18,6 +18,7 @@ type
   EMQTTConnectionException = class(EMQTTException);
   EMQTTTimeoutException = class(EMQTTException);
 
+
   TMQTTPacketType = (
     ptReserved = 0,
     ptConnect = 1,
@@ -185,6 +186,13 @@ type
     Username: string;
     Password: string;
     Will: TMQTTWillOptions;
+    // MQTT 5 §3.1.2.11.2 - seconds the broker keeps the session alive AFTER disconnect.
+    //   0           = session ends when the network connection closes (spec default)
+    //   1..N        = broker retains the session for N seconds after disconnect
+    //   $FFFFFFFF   = session never expires
+    // WARNING: to receive messages accumulated while the client was offline
+    // (CleanStart=False), you MUST also set SessionExpiryInterval > 0; otherwise
+    // the broker discards the session on disconnect and queued messages/subs are lost.
     SessionExpiryInterval: Cardinal;
     ReceiveMaximum: Word;
     MaxPacketSize: Cardinal;
@@ -232,14 +240,14 @@ type
   TMQTTMessageHandler = reference to procedure(const Msg: TMQTTMessage);
   TMQTTDisconnectHandler = reference to procedure(ReasonCode: TMQTTReasonCode; const ReasonString: string);
   TMQTTErrorHandler = reference to procedure(const ErrorMsg: string);
-  TMQTTConnectHandler = reference to procedure(ReasonCode: TMQTTReasonCode);
+  TMQTTConnectHandler = reference to procedure(ReasonCode: TMQTTReasonCode; SessionPresent: Boolean);
   TMQTTPublishAckHandler = reference to procedure(PacketID: Word; ReasonCode: TMQTTReasonCode);
 
   // Method pointer handlers (of object)
   TMQTTMessageEvent = procedure(const Topic: string; const Payload: TBytes) of object;
   TMQTTDisconnectEvent = procedure(ReasonCode: TMQTTReasonCode; const ReasonString: string) of object;
   TMQTTErrorEvent = procedure(const ErrorMsg: string) of object;
-  TMQTTConnectEvent = procedure(ReasonCode: TMQTTReasonCode) of object;
+  TMQTTConnectEvent = procedure(ReasonCode: TMQTTReasonCode; SessionPresent: Boolean) of object;
 
   // Extended handler with Dup flag and QoS info
   TMQTTExtendedHandler = reference to procedure(const Topic: string; const Payload: TBytes; Dup: Boolean; QoS: TMQTTQoS);
@@ -305,6 +313,10 @@ begin
   Username := '';
   Password := '';
   Will.Clear;
+  // Per MQTT 5 §3.1.2.11.2: when the property is absent the implicit value is 0.
+  // Consistent with CleanStart=True above (session discarded anyway).
+  // If you flip CleanStart to False remember to also set SessionExpiryInterval > 0,
+  // otherwise session persistence is ineffective. See the field comment for details.
   SessionExpiryInterval := 0;
   ReceiveMaximum := 65535;
   MaxPacketSize := 0;

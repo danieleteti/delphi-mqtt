@@ -50,6 +50,12 @@ type
     ManualAckHandler: TMQTTManualAckHandler;
     HandlerType: (htSimple, htExtended, htManualAck);
     QoS: TMQTTQoS;
+    // True when this entry was created via RestoreSubscriptionHandler:
+    // the local dispatcher is registered but the subscription exists only
+    // broker-side (session resumed with SessionPresent=True). The QoS field
+    // above is not meaningful in this case. ResubscribeAll skips these
+    // entries on auto-reconnect because the original QoS is unknown.
+    Bound: Boolean;
   end;
 
   TPendingQoS2Inbound = record
@@ -76,6 +82,13 @@ type
     procedure SubscribeManualAck(const Topic: string; Handler: TMQTTManualAckEvent; QoS: TMQTTQoS = atLeastOnce); overload;
     procedure SubscribeEx(const Topic: string; Handler: TMQTTExtendedHandler; QoS: TMQTTQoS = atMostOnce); overload;
     procedure SubscribeEx(const Topic: string; Handler: TMQTTExtendedEvent; QoS: TMQTTQoS = atMostOnce); overload;
+    // Re-attach the local dispatcher to a subscription that already exists
+    // broker-side (typical usage after Connect when LastSessionPresent=True).
+    // Does NOT send SUBSCRIBE on the wire. The effective QoS of received
+    // PUBLISH packets is the one stored by the broker for the original
+    // subscription, not a parameter of this call.
+    procedure RestoreSubscriptionHandler(const Topic: string; Handler: TMQTTHandler); overload;
+    procedure RestoreSubscriptionHandler(const Topic: string; Handler: TMQTTMessageEvent); overload;
     procedure Unsubscribe(const Topic: string);
     function IsConnected: Boolean;
     function GetState: TMQTTConnectionState;
@@ -95,10 +108,14 @@ type
     procedure SetOnSubscribeAck(Handler: TMQTTSubscribeAckEvent); overload;
     procedure SetLogger(const Logger: IMQTTLogger);
     function GetLogger: IMQTTLogger;
+    function GetLastSessionPresent: Boolean;
     property Connected: Boolean read IsConnected;
     property State: TMQTTConnectionState read GetState;
     property AutoReconnect: Boolean read GetAutoReconnect write SetAutoReconnect;
     property Logger: IMQTTLogger read GetLogger write SetLogger;
+    // True if the last CONNACK reported Session Present = 1
+    // (broker had a persistent session for this ClientID).
+    property LastSessionPresent: Boolean read GetLastSessionPresent;
   end;
 
   TMQTTClient = class(TInterfacedObject, IMQTTClient)
@@ -130,6 +147,7 @@ type
     FOnSubscribeAck: TMQTTSubscribeAckHandler;
     FLogger: IMQTTLogger;
     FShutdown: Boolean;
+    FLastSessionPresent: Boolean;
 
     function GetNextPacketID: Word;
     function ReadPacket: TBytes;
@@ -173,6 +191,7 @@ type
     procedure SetOnSubscribeAck(Handler: TMQTTSubscribeAckEvent); overload;
     procedure SetLogger(const Logger: IMQTTLogger);
     function GetLogger: IMQTTLogger;
+    function GetLastSessionPresent: Boolean;
     function SnapshotLogger: IMQTTLogger;
     procedure NotifyPacketSent(const Packet: TBytes);
     procedure NotifyPacketReceived(const Packet: TBytes);
@@ -200,6 +219,8 @@ type
     procedure SubscribeManualAck(const Topic: string; Handler: TMQTTManualAckEvent; QoS: TMQTTQoS = atLeastOnce); overload;
     procedure SubscribeEx(const Topic: string; Handler: TMQTTExtendedHandler; QoS: TMQTTQoS = atMostOnce); overload;
     procedure SubscribeEx(const Topic: string; Handler: TMQTTExtendedEvent; QoS: TMQTTQoS = atMostOnce); overload;
+    procedure RestoreSubscriptionHandler(const Topic: string; Handler: TMQTTHandler); overload;
+    procedure RestoreSubscriptionHandler(const Topic: string; Handler: TMQTTMessageEvent); overload;
     procedure Unsubscribe(const Topic: string);
   end;
 
@@ -319,7 +340,7 @@ end;
 procedure TMQTTClient.SetOnConnect(Handler: TMQTTConnectEvent);
 begin
   if Assigned(Handler) then
-    FOnConnect := procedure(ReasonCode: TMQTTReasonCode) begin Handler(ReasonCode); end
+    FOnConnect := procedure(ReasonCode: TMQTTReasonCode; SessionPresent: Boolean) begin Handler(ReasonCode, SessionPresent); end
   else
     FOnConnect := nil;
 end;
@@ -392,6 +413,18 @@ begin
   FLock.Enter;
   try
     Result := FLogger;
+  finally
+    FLock.Leave;
+  end;
+end;
+
+function TMQTTClient.GetLastSessionPresent: Boolean;
+begin
+  // Atomic snapshot of the flag published by the most recent CONNACK
+  // (both initial Connect and automatic reconnection).
+  FLock.Enter;
+  try
+    Result := FLastSessionPresent;
   finally
     FLock.Leave;
   end;
@@ -597,6 +630,7 @@ begin
 
     FState := Connected;
     FLastActivity := Now;
+    FLastSessionPresent := SessionPresent;
     if SessionPresent then
       SnapshotLogger.Info('Connected to %s:%d (ClientID="%s", MQTT v%d, SessionPresent=True)',
         [Host, Port, Options.ClientID, Ord(Options.Version)])
@@ -612,7 +646,7 @@ begin
       FPinger := TTask.Run(procedure begin PingerLoop; end);
 
     if Assigned(FOnConnect) then
-      FOnConnect(TMQTTReasonCode(ReasonCode));
+      FOnConnect(TMQTTReasonCode(ReasonCode), SessionPresent);
 
   except
     on E: Exception do
@@ -957,7 +991,6 @@ begin
   if not TMQTTProtocol.ParsePubAck(Packet, Ord(FOptions.Version), PacketID, ReasonCode) then
     Exit;
 
-  Found := False;
   FLock.Enter;
   try
     Found := FPendingPublish.TryGetValue(PacketID, Pending);
@@ -1051,7 +1084,6 @@ begin
   if not TMQTTProtocol.ParsePubComp(Packet, Ord(FOptions.Version), PacketID, ReasonCode) then
     Exit;
 
-  Found := False;
   FLock.Enter;
   try
     Found := FPendingPublish.TryGetValue(PacketID, Pending);
@@ -1387,7 +1419,9 @@ begin
         begin
           FState := Connected;
           FLastActivity := Now;
-          SnapshotLogger.Info('Reconnected to %s:%d', [FHost, FPort]);
+          FLastSessionPresent := SessionPresent;
+          SnapshotLogger.Info('Reconnected to %s:%d (SessionPresent=%s)',
+            [FHost, FPort, BoolToStr(SessionPresent, True)]);
 
           // Restart pinger (the old one was nil'd at the top of DoReconnect)
           if FOptions.KeepAliveSec > 0 then
@@ -1403,7 +1437,7 @@ begin
           RetryPendingPublishes;
 
           if Assigned(FOnConnect) then
-            FOnConnect(TMQTTReasonCode(ReasonCode));
+            FOnConnect(TMQTTReasonCode(ReasonCode), SessionPresent);
 
           Exit;
         end;
@@ -1459,6 +1493,19 @@ begin
 
   for Pair in Snapshot do
   begin
+    // Skip entries created via RestoreSubscriptionHandler: their original QoS
+    // is unknown, and the broker-side subscription is expected to survive
+    // either via session persistence (LastSessionPresent=True after reconnect)
+    // or to be re-established explicitly by the caller. Issuing a SUBSCRIBE
+    // with a guessed QoS could silently override the original one.
+    if Pair.Value.Bound then
+    begin
+      SnapshotLogger.Warning('Skipping RE-SUBSCRIBE for bound-only topic "%s" ' +
+        '(original QoS unknown). If the broker session was lost, call Subscribe ' +
+        'explicitly.', [Pair.Key]);
+      Continue;
+    end;
+
     PacketID := GetNextPacketID;
     Packet := TMQTTProtocol.BuildSubscribe(Ord(FOptions.Version), PacketID,
       Pair.Key, Pair.Value.QoS);
@@ -1690,6 +1737,7 @@ begin
   SubInfo.ManualAckHandler := nil;
   SubInfo.HandlerType := htSimple;
   SubInfo.QoS := QoS;
+  SubInfo.Bound := False;
 
   FLock.Enter;
   try
@@ -1702,6 +1750,48 @@ begin
   Packet := TMQTTProtocol.BuildSubscribe(Ord(FOptions.Version), PacketID, Topic, QoS);
   SnapshotLogger.Info('SUBSCRIBE PacketID=%d topic="%s" qos=%d', [PacketID, Topic, Ord(QoS)]);
   SendPacket(Packet);
+end;
+
+procedure TMQTTClient.RestoreSubscriptionHandler(const Topic: string; Handler: TMQTTHandler);
+var
+  SubInfo: TSubscriptionInfo;
+begin
+  // Register only the local dispatcher for a topic whose subscription already
+  // exists broker-side (typical after Connect with LastSessionPresent=True).
+  // Does NOT send SUBSCRIBE: no round-trip, no SUBACK, no PacketID consumed.
+  // The effective QoS of received PUBLISH packets is the one stored by the
+  // broker for the original subscription, applied by the wire packet parser.
+  //
+  // Can be called BEFORE Connect (recommended). The broker may start delivering
+  // queued messages immediately after CONNACK, so binding the handler upfront
+  // avoids a race where the first PUBLISH arrives before the dispatcher exists.
+  if not TMQTTProtocol.IsValidTopicFilter(Topic) then
+    raise EMQTTException.Create('Invalid topic filter');
+
+  SubInfo.Handler := Handler;
+  SubInfo.ExtendedHandler := nil;
+  SubInfo.ManualAckHandler := nil;
+  SubInfo.HandlerType := htSimple;
+  SubInfo.QoS := atMostOnce; // placeholder: not used while Bound=True
+  SubInfo.Bound := True;
+
+  FLock.Enter;
+  try
+    FSubscriptions.AddOrSetValue(Topic, SubInfo);
+  finally
+    FLock.Leave;
+  end;
+
+  SnapshotLogger.Info('RESTORE handler topic="%s" (no wire SUBSCRIBE)', [Topic]);
+end;
+
+procedure TMQTTClient.RestoreSubscriptionHandler(const Topic: string; Handler: TMQTTMessageEvent);
+begin
+  RestoreSubscriptionHandler(Topic,
+    procedure(const ATopic: string; const APayload: TBytes)
+    begin
+      Handler(ATopic, APayload);
+    end);
 end;
 
 procedure TMQTTClient.Subscribe(const Topic: string; Handler: TMQTTMessageEvent; QoS: TMQTTQoS);
@@ -1732,6 +1822,7 @@ begin
   SubInfo.ManualAckHandler := Handler;
   SubInfo.HandlerType := htManualAck;
   SubInfo.QoS := QoS;
+  SubInfo.Bound := False;
 
   FLock.Enter;
   try
@@ -1773,6 +1864,7 @@ begin
   SubInfo.ManualAckHandler := nil;
   SubInfo.HandlerType := htExtended;
   SubInfo.QoS := QoS;
+  SubInfo.Bound := False;
 
   FLock.Enter;
   try

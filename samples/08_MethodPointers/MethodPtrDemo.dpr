@@ -27,7 +27,7 @@ type
     FMessageCount: Integer;
     // Method pointer handlers (of object)
     procedure HandleMessage(const Topic: string; const Payload: TBytes);
-    procedure HandleConnect(ReasonCode: TMQTTReasonCode);
+    procedure HandleConnect(ReasonCode: TMQTTReasonCode; SessionPresent: Boolean);
     procedure HandleDisconnect(ReasonCode: TMQTTReasonCode; const ReasonString: string);
     procedure HandleError(const ErrorMsg: string);
   public
@@ -51,9 +51,10 @@ begin
     [FMessageCount, Topic, TEncoding.UTF8.GetString(Payload)]));
 end;
 
-procedure TMQTTDemo.HandleConnect(ReasonCode: TMQTTReasonCode);
+procedure TMQTTDemo.HandleConnect(ReasonCode: TMQTTReasonCode; SessionPresent: Boolean);
 begin
-  Writeln('Event: Connected with reason code ', Ord(ReasonCode));
+  Writeln('Event: Connected with reason code ', Ord(ReasonCode),
+    ' (sessionPresent=', BoolToStr(SessionPresent, True), ')');
 end;
 
 procedure TMQTTDemo.HandleDisconnect(ReasonCode: TMQTTReasonCode; const ReasonString: string);

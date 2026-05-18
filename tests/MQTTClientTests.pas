@@ -56,6 +56,16 @@ type
     procedure Publish_QoS2_RoundTrip;
     [Test]
     procedure RetainFlag_PreservedOnBroker;
+    [Test]
+    procedure LastSessionPresent_False_OnCleanStart;
+    [Test]
+    procedure LastSessionPresent_True_OnSecondConnectWithCleanStartFalse;
+    [Test]
+    procedure RestoreSubscriptionHandler_RejectsInvalidFilter;
+    [Test]
+    procedure RestoreSubscriptionHandler_DoesNotSendSubscribeOnWire;
+    [Test]
+    procedure RestoreSubscriptionHandler_DispatchesQueuedMessagesAfterSessionRestore;
   end;
 
 implementation
@@ -582,6 +592,191 @@ begin
       Sleep(100);
     finally
       Pub.Disconnect;
+    end;
+  finally
+    GotEvent.Free;
+  end;
+end;
+
+procedure TMQTTClientTests.LastSessionPresent_False_OnCleanStart;
+var
+  Client: IMQTTClient;
+  Opts: TMQTTConnectOptions;
+begin
+  RequireBroker;
+  Client := CreateMQTTClient;
+  Opts := MakeOptions(NewClientID);
+  Opts.CleanStart := True;
+  Client.Connect(FBrokerHost, FBrokerPort, Opts);
+  try
+    Assert.IsFalse(Client.LastSessionPresent,
+      'CleanStart=True must always yield SessionPresent=False');
+  finally
+    Client.Disconnect;
+  end;
+end;
+
+procedure TMQTTClientTests.LastSessionPresent_True_OnSecondConnectWithCleanStartFalse;
+var
+  Client: IMQTTClient;
+  Opts: TMQTTConnectOptions;
+  ClientID: string;
+begin
+  RequireBroker;
+  ClientID := NewClientID;
+
+  // First connect: prime a persistent session on the broker.
+  Client := CreateMQTTClient;
+  Opts := MakeOptions(ClientID);
+  Opts.CleanStart := False;
+  Opts.SessionExpiryInterval := 60;
+  Client.Connect(FBrokerHost, FBrokerPort, Opts);
+  Assert.IsFalse(Client.LastSessionPresent,
+    'first connect with this ClientID should be a brand-new session');
+  Client.Disconnect;
+  Client := nil;
+
+  // Second connect: broker must report SessionPresent=True for the same ClientID.
+  Client := CreateMQTTClient;
+  Opts := MakeOptions(ClientID);
+  Opts.CleanStart := False;
+  Opts.SessionExpiryInterval := 60;
+  Client.Connect(FBrokerHost, FBrokerPort, Opts);
+  try
+    Assert.IsTrue(Client.LastSessionPresent,
+      'broker should restore the session created by the previous connect');
+  finally
+    // Cleanup: tear the session down so it does not leak across runs.
+    Client.Disconnect;
+    Client := nil;
+    Client := CreateMQTTClient;
+    Opts := MakeOptions(ClientID);
+    Opts.CleanStart := True;
+    Client.Connect(FBrokerHost, FBrokerPort, Opts);
+    Client.Disconnect;
+  end;
+end;
+
+procedure TMQTTClientTests.RestoreSubscriptionHandler_RejectsInvalidFilter;
+var
+  Client: IMQTTClient;
+  NoopHandler: TMQTTHandler;
+begin
+  // Callable before Connect: no broker round-trip needed for the validation path.
+  Client := CreateMQTTClient;
+  NoopHandler :=
+    procedure(const Topic: string; const Payload: TBytes)
+    begin
+    end;
+  Assert.WillRaise(
+    procedure
+    begin
+      Client.RestoreSubscriptionHandler('bad/+filter', NoopHandler);
+    end,
+    EMQTTException);
+end;
+
+procedure TMQTTClientTests.RestoreSubscriptionHandler_DoesNotSendSubscribeOnWire;
+var
+  Client: IMQTTClient;
+  SubscribePacketSeen: Boolean;
+  NoopHandler: TMQTTHandler;
+begin
+  RequireBroker;
+  SubscribePacketSeen := False;
+  Client := CreateMQTTClient;
+  Client.SetOnPacketSent(
+    procedure(PacketType: TMQTTPacketType; const RawPacket: TBytes)
+    begin
+      if PacketType = ptSubscribe then
+        SubscribePacketSeen := True;
+    end);
+  Client.Connect(FBrokerHost, FBrokerPort, MakeOptions(NewClientID));
+  try
+    NoopHandler :=
+      procedure(const Topic: string; const Payload: TBytes)
+      begin
+      end;
+    Client.RestoreSubscriptionHandler('dunit/restore/' + IntToStr(Random(1000000)),
+      NoopHandler);
+    Sleep(200); // give any rogue background send a chance to surface
+    Assert.IsFalse(SubscribePacketSeen,
+      'RestoreSubscriptionHandler must not emit a SUBSCRIBE packet on the wire');
+  finally
+    Client.Disconnect;
+  end;
+end;
+
+procedure TMQTTClientTests.RestoreSubscriptionHandler_DispatchesQueuedMessagesAfterSessionRestore;
+var
+  Subscriber, Publisher: IMQTTClient;
+  Opts: TMQTTConnectOptions;
+  ClientID, Topic, Payload, Received: string;
+  GotEvent: TEvent;
+begin
+  RequireBroker;
+  ClientID := NewClientID;
+  Topic := 'dunit/restore/' + IntToStr(Random(1000000));
+  Payload := 'queued-' + IntToStr(Random(1000000));
+  Received := '';
+  GotEvent := TEvent.Create(nil, True, False, '');
+  try
+    // Phase 1: prime a persistent session with a subscription, then disconnect.
+    Subscriber := CreateMQTTClient;
+    Opts := MakeOptions(ClientID);
+    Opts.CleanStart := False;
+    Opts.SessionExpiryInterval := 60;
+    Subscriber.Connect(FBrokerHost, FBrokerPort, Opts);
+    Subscriber.Subscribe(Topic,
+      procedure(const ATopic: string; const APayload: TBytes)
+      begin
+        // No-op: phase-1 subscriber only primes the broker-side subscription.
+      end,
+      atLeastOnce);
+    Sleep(300); // let SUBACK land before disconnect
+    Subscriber.Disconnect;
+    Subscriber := nil;
+
+    // Phase 2: a separate publisher fires a QoS 1 message while the subscriber is offline.
+    Publisher := CreateMQTTClient;
+    Publisher.Connect(FBrokerHost, FBrokerPort, MakeOptions(NewClientID));
+    try
+      Assert.IsTrue(
+        Publisher.PublishSync(Topic, TEncoding.UTF8.GetBytes(Payload), atLeastOnce, False, 3000),
+        'publisher did not receive PUBACK from broker');
+    finally
+      Publisher.Disconnect;
+      Publisher := nil;
+    end;
+
+    // Phase 3: brand-new TMQTTClient instance, same ClientID. Bind the handler
+    // BEFORE Connect so it is ready when the broker begins draining the queue.
+    Subscriber := CreateMQTTClient;
+    Subscriber.RestoreSubscriptionHandler(Topic,
+      procedure(const ATopic: string; const APayload: TBytes)
+      begin
+        Received := TEncoding.UTF8.GetString(APayload);
+        GotEvent.SetEvent;
+      end);
+    Opts := MakeOptions(ClientID);
+    Opts.CleanStart := False;
+    Opts.SessionExpiryInterval := 60;
+    Subscriber.Connect(FBrokerHost, FBrokerPort, Opts);
+    try
+      Assert.IsTrue(Subscriber.LastSessionPresent,
+        'broker must report SessionPresent=True for the persisted ClientID');
+      Assert.AreEqual(wrSignaled, GotEvent.WaitFor(WAIT_MS_LONG),
+        'queued message was not dispatched via the restored handler');
+      Assert.AreEqual(Payload, Received);
+    finally
+      // Cleanup: tear the session down.
+      Subscriber.Disconnect;
+      Subscriber := nil;
+      Subscriber := CreateMQTTClient;
+      Opts := MakeOptions(ClientID);
+      Opts.CleanStart := True;
+      Subscriber.Connect(FBrokerHost, FBrokerPort, Opts);
+      Subscriber.Disconnect;
     end;
   finally
     GotEvent.Free;

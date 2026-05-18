@@ -115,9 +115,10 @@ begin
 
     // Set up event handlers
     Client.SetOnConnect(
-      procedure(ReasonCode: TMQTTReasonCode)
+      procedure(ReasonCode: TMQTTReasonCode; SessionPresent: Boolean)
       begin
-        Writeln('  Event: Connected (ReasonCode=' + IntToStr(Ord(ReasonCode)) + ')');
+        Writeln('  Event: Connected (ReasonCode=' + IntToStr(Ord(ReasonCode)) +
+          ', SessionPresent=' + BoolToStr(SessionPresent, True) + ')');
       end);
 
     Client.SetOnDisconnect(
