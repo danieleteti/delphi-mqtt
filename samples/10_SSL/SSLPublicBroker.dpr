@@ -3,20 +3,19 @@ program SSLPublicBroker;
 {$APPTYPE CONSOLE}
 
 {
-  SSL Connection to Public MQTT Brokers
+  SSL/TLS connection to public MQTT brokers — cascade fallback.
 
-  This sample connects to free public MQTT brokers using SSL/TLS.
-  No registration or certificates required!
+  Public test brokers are unstable (rate limit, ACL, maintenance windows).
+  To make the demo reliable we try the well-known ones IN CASCADE: the first
+  one that responds wins.
 
-  Public brokers tested:
-  - broker.hivemq.com:8883 (HiveMQ)
-  - broker.emqx.io:8883 (EMQX)
-  - test.mosquitto.org:8883 (Eclipse Mosquitto)
+  TLS 1.2 with sslVerifyNone (test-only). For production use sslVerifyPeer +
+  RootCertFile.
 
   Requirements:
-  - OpenSSL DLLs in executable path or system PATH
-    For 64-bit: libssl-1_1-x64.dll, libcrypto-1_1-x64.dll
-    For 32-bit: libeay32.dll, ssleay32.dll
+    - OpenSSL legacy 1.0.2 DLLs next to the .exe (or in PATH):
+        libeay32.dll, ssleay32.dll
+    - Download: https://slproweb.com/products/Win32OpenSSL.html (1.0.2u Light)
 }
 
 uses
@@ -25,101 +24,37 @@ uses
   System.SyncObjs,
   System.StrUtils,
   IdSSLOpenSSL,
+  IdSSLOpenSSLHeaders,
   MQTT.Types in '..\..\src\MQTT.Types.pas',
   MQTT.Protocol in '..\..\src\MQTT.Protocol.pas',
   MQTT.Client in '..\..\src\MQTT.Client.pas';
 
+type
+  TBrokerEndpoint = record
+    Name: string;
+    Host: string;
+    Port: Word;
+  end;
+
 const
-  // Choose your broker (all work with SSL, no auth required)
-  BROKER_HOST = 'test.mosquitto.org';
-  BROKER_PORT = 8883;
+  BROKERS: array[0..2] of TBrokerEndpoint = (
+    (Name: 'Eclipse Mosquitto'; Host: 'test.mosquitto.org'; Port: 8883),
+    (Name: 'EMQX';              Host: 'broker.emqx.io';     Port: 8883),
+    (Name: 'HiveMQ';            Host: 'broker.hivemq.com';  Port: 8883)
+  );
 
-  // Alternative brokers:
-  // BROKER_HOST = 'broker.emqx.io'; BROKER_PORT = 8883;
-  // BROKER_HOST = 'test.mosquitto.org'; BROKER_PORT = 8883;
-
+function TryConnect(out Endpoint: TBrokerEndpoint;
+  const Options: TMQTTConnectOptions; const SSLOptions: TMQTTSSLOptions): IMQTTClient;
 var
   Client: IMQTTClient;
-  Options: TMQTTConnectOptions;
-  SSLOptions: TMQTTSSLOptions;
-  MessageReceived: TEvent;
-  ReceivedCount: Integer;
-
-procedure PrintHeader;
+  I: Integer;
 begin
-  Writeln('================================================');
-  Writeln('  Delphi MQTT - SSL/TLS Public Broker Demo');
-  Writeln('================================================');
-  Writeln;
-end;
-
-procedure CheckOpenSSL;
-begin
-  Write('Checking OpenSSL... ');
-  if IdSSLOpenSSL.LoadOpenSSLLibrary then
+  Result := nil;
+  for I := Low(BROKERS) to High(BROKERS) do
   begin
-    Writeln('OK');
-    Writeln('  Version: ' + String(IdSSLOpenSSL.OpenSSLVersion));
-  end
-  else
-  begin
-    Writeln('FAILED');
-    Writeln;
-    Writeln('OpenSSL libraries not found!');
-    Writeln;
-    Writeln('Please download OpenSSL DLLs and place them in the executable folder:');
-    Writeln('  https://slproweb.com/products/Win32OpenSSL.html');
-    Writeln;
-    {$IFDEF WIN64}
-    Writeln('For 64-bit, you need:');
-    Writeln('  - libssl-1_1-x64.dll');
-    Writeln('  - libcrypto-1_1-x64.dll');
-    {$ELSE}
-    Writeln('For 32-bit, you need:');
-    Writeln('  - libeay32.dll');
-    Writeln('  - ssleay32.dll');
-    {$ENDIF}
-    Writeln;
-    Writeln('Press Enter to exit...');
-    Readln;
-    Halt(1);
-  end;
-end;
-
-begin
-  ReportMemoryLeaksOnShutdown := True;
-  Randomize;
-  ReceivedCount := 0;
-  MessageReceived := TEvent.Create(nil, False, False, '');
-
-  try
-    PrintHeader;
-    CheckOpenSSL;
-    Writeln;
-
-    // Create client
+    Writeln(Format('-> Trying %s (%s:%d) ...',
+      [BROKERS[I].Name, BROKERS[I].Host, BROKERS[I].Port]));
     Client := CreateMQTTClient;
-
-    // Configure MQTT options
-    Options.SetDefaults;
-    Options.ClientID := 'DelphiSSL_' + IntToStr(Random(100000));
-    Options.KeepAliveSec := 60;
-    Options.CleanStart := True;
-    Options.Version := MQTT5;
-
-    // Configure SSL - minimal config for public brokers
-    SSLOptions.SetDefaults;
-    SSLOptions.Enabled := True;
-    SSLOptions.Method := sslTLS1_2;
-    SSLOptions.VerifyMode := sslVerifyNone;  // Public brokers don't need cert verification
-
-    // Set up event handlers
-    Client.SetOnConnect(
-      procedure(ReasonCode: TMQTTReasonCode; SessionPresent: Boolean)
-      begin
-        Writeln('  Event: Connected (ReasonCode=' + IntToStr(Ord(ReasonCode)) +
-          ', SessionPresent=' + BoolToStr(SessionPresent, True) + ')');
-      end);
 
     Client.SetOnDisconnect(
       procedure(ReasonCode: TMQTTReasonCode; const ReasonString: string)
@@ -133,35 +68,91 @@ begin
         Writeln('  Event: Error - ' + ErrorMsg);
       end);
 
-    // Connect with SSL
-    Writeln('Connecting to ' + BROKER_HOST + ':' + IntToStr(BROKER_PORT) + ' (TLS 1.2)...');
     try
-      Client.Connect(BROKER_HOST, BROKER_PORT, Options, SSLOptions);
-      Writeln('Connected successfully!');
+      Client.Connect(BROKERS[I].Host, BROKERS[I].Port, Options, SSLOptions);
+      Endpoint := BROKERS[I];
+      Result := Client;
+      Exit;
     except
       on E: Exception do
       begin
-        Writeln('Connection failed: ' + E.Message);
-        Writeln;
-        Writeln('Press Enter to exit...');
-        Readln;
-        Halt(1);
+        Writeln(Format('   FAILED (%s: %s)', [E.ClassName, E.Message]));
+        Client := nil; // releases SSL handler and socket
       end;
     end;
+  end;
+end;
+
+var
+  Client: IMQTTClient;
+  Options: TMQTTConnectOptions;
+  SSLOptions: TMQTTSSLOptions;
+  Endpoint: TBrokerEndpoint;
+  MessageReceived: TEvent;
+  ReceivedCount: Integer;
+
+begin
+  ReportMemoryLeaksOnShutdown := True;
+  Randomize;
+  ReceivedCount := 0;
+  MessageReceived := TEvent.Create(nil, False, False, '');
+
+  try
+    Writeln('================================================');
+    Writeln('  Delphi MQTT - SSL/TLS Public Broker Demo');
+    Writeln('================================================');
     Writeln;
 
-    // Show connection info
+    Write('Checking OpenSSL... ');
+    if not IdSSLOpenSSL.LoadOpenSSLLibrary then
+    begin
+      Writeln('FAILED');
+      Writeln;
+      Writeln('OpenSSL libraries not found. Need libeay32.dll + ssleay32.dll');
+      Writeln('(OpenSSL 1.0.2) next to the .exe.');
+      Writeln('Download: https://slproweb.com/products/Win32OpenSSL.html');
+      Writeln;
+      Writeln('Press Enter to exit...');
+      Readln;
+      Halt(1);
+    end;
+    Writeln('OK (' + String(IdSSLOpenSSL.OpenSSLVersion) + ')');
+    Writeln;
+
+    Options.SetDefaults;
+    Options.ClientID := 'DelphiSSL_' + IntToStr(Random(100000));
+    Options.KeepAliveSec := 60;
+    Options.CleanStart := True;
+    Options.Version := MQTT5;
+
+    SSLOptions.SetDefaults;
+    SSLOptions.Enabled := True;
+    SSLOptions.Method := sslTLS1_2;
+    SSLOptions.VerifyMode := sslVerifyNone; // OK for public test brokers
+
+    Writeln('Trying public brokers in cascade (TLS 1.2)...');
+    Client := TryConnect(Endpoint, Options, SSLOptions);
+    if Client = nil then
+    begin
+      Writeln;
+      Writeln('No public broker responded. All unreachable or rate-limited.');
+      Writeln('Retry later or use a local broker (mosquitto on 8883).');
+      Writeln;
+      Writeln('Press Enter to exit...');
+      Readln;
+      Halt(1);
+    end;
+
+    Writeln;
     Writeln('Connection Details:');
-    Writeln('  Broker:    ' + BROKER_HOST + ':' + IntToStr(BROKER_PORT));
+    Writeln('  Broker:    ' + Endpoint.Name + ' (' + Endpoint.Host + ':' + IntToStr(Endpoint.Port) + ')');
     Writeln('  Client ID: ' + Options.ClientID);
     Writeln('  Protocol:  MQTT 5.0 over TLS 1.2');
     Writeln('  Status:    ' + IfThen(Client.Connected, 'Connected', 'Disconnected'));
     Writeln;
 
-    // Create unique topic for this session
     var TestTopic := 'delphi/mqtt/ssl/test/' + Options.ClientID;
 
-    // Subscribe to test topic
     Writeln('Subscribing to: ' + TestTopic);
     Client.Subscribe(TestTopic,
       procedure(const Topic: string; const Payload: TBytes)
@@ -177,7 +168,6 @@ begin
     Writeln('Subscribed with QoS 1');
     Writeln;
 
-    // Publish test messages
     Writeln('Publishing test messages...');
     Writeln;
 
@@ -185,8 +175,6 @@ begin
     var Msg1 := 'Hello from Delphi SSL! Time: ' + FormatDateTime('hh:nn:ss', Now);
     Client.Publish(TestTopic, Msg1, atLeastOnce);
     Writeln('Sent: ' + Msg1);
-
-    // Wait for echo
     if MessageReceived.WaitFor(3000) = wrSignaled then
       Writeln('Echo received!')
     else
@@ -198,21 +186,16 @@ begin
                 FormatDateTime('yyyy-mm-dd"T"hh:nn:ss', Now) + '"}';
     Client.Publish(TestTopic, Msg2, atLeastOnce);
     Writeln('Sent JSON: ' + Msg2);
-
-    // Wait for echo
     MessageReceived.WaitFor(3000);
     Writeln;
 
-    // Message 3: With QoS 2
+    // Message 3: QoS 2
     var Msg3 := 'QoS 2 message - Exactly Once Delivery';
     Client.Publish(TestTopic, Msg3, exactlyOnce);
     Writeln('Sent QoS 2: ' + Msg3);
-
-    // Wait for echo
     MessageReceived.WaitFor(3000);
     Writeln;
 
-    // Interactive mode
     Writeln('================================================');
     Writeln('Interactive mode - Type messages to send');
     Writeln('Press Enter on empty line to exit');
@@ -224,14 +207,10 @@ begin
       Write('> ');
       var Input: string;
       Readln(Input);
-
       if Input = '' then
         Break;
-
       Client.Publish(TestTopic, Input, atLeastOnce);
       Writeln('Sent: ' + Input);
-
-      // Brief wait to see echo
       Sleep(500);
     end;
 
