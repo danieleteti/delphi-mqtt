@@ -31,10 +31,11 @@ type
     Retain: Boolean;
     Timestamp: TDateTime;
     RetryCount: Integer;
-    State: (psPending, psWaitingPubRec, psWaitingPubComp);
-    // Per-publish wakeup signal. Non-nil only for PublishSync callers; the
-    // ACK handlers (PubAck/PubComp) signal this event when the matching
-    // PacketID is removed from FPendingPublish. NEVER share between calls.
+    State: (psPending, psWaitingPubRec, psWaitingPubComp, psFailed);
+    // Per-publish wakeup signal. Non-nil only for PublishSync callers.
+    // Signalled under FLock by CompletePending: on success the entry is
+    // removed, on failure it stays with State = psFailed and PublishSync
+    // removes it. NEVER share between calls.
     AckEvent: TEvent;
   end;
 
@@ -166,6 +167,9 @@ type
     FOnSubscribeAck: TMQTTSubscribeAckHandler;
     FLogger: IMQTTLogger;
     FShutdown: Boolean;
+    FStopEvent: TEvent;           // wakes the pinger / reconnect back-off on Disconnect
+    FReceiverThreadID: TThreadID;
+    FPingSentAt: TDateTime;       // 0 = no PINGREQ outstanding
     FLastSessionPresent: Boolean;
 
     function GetNextPacketID: Word;
@@ -185,7 +189,7 @@ type
     procedure HandleDisconnect(const Packet: TBytes);
     procedure DispatchMessageEx(const Topic: string; const Payload: TBytes; Dup: Boolean; QoS: TMQTTQoS; PacketID: Word);
     function DispatchMessageManualAck(const Topic: string; const Payload: TBytes; Dup: Boolean; QoS: TMQTTQoS; PacketID: Word): Boolean;
-    function HasManualAckSubscription(const Topic: string): Boolean;
+    procedure CompletePending(PacketID: Word; Success: Boolean; const Why: string);
     procedure SendAck(QoS: TMQTTQoS; PacketID: Word);
     procedure DoReconnect;
     procedure DoDisconnect(ReasonCode: TMQTTReasonCode; const ReasonString: string);
@@ -265,7 +269,10 @@ begin
   inherited Create;
   FIndy := TIdTCPClient.Create(nil);
   FIndy.ConnectTimeout := 5000;
-  FIndy.ReadTimeout := 100;
+  // Reads only start once CheckForDataOnSource saw data, so this is the
+  // budget for the rest of a packet to arrive, not a polling interval.
+  // A timeout mid-packet leaves the stream desynchronised and is fatal.
+  FIndy.ReadTimeout := 30000;
   FSSLHandler := nil;
   FSSLOptions.SetDefaults;
   FSubscriptions := TDictionary<string, TSubscriptionInfo>.Create;
@@ -273,6 +280,7 @@ begin
   FPendingQoS2Inbound := TDictionary<Word, TPendingQoS2Inbound>.Create;
   FLock := TCriticalSection.Create;
   FWriteLock := TCriticalSection.Create;
+  FStopEvent := TEvent.Create(nil, True, False, '');
   FState := Disconnected;
   FNextPacketID := 1;
   FAutoReconnect := False;
@@ -294,6 +302,7 @@ begin
   FSubscriptions.Free;
   FWriteLock.Free;
   FLock.Free;
+  FStopEvent.Free;
   FIndy.Free;
   inherited Destroy;
 end;
@@ -302,10 +311,13 @@ function TMQTTClient.GetNextPacketID: Word;
 begin
   FLock.Enter;
   try
-    Result := FNextPacketID;
-    Inc(FNextPacketID);
-    if FNextPacketID = 0 then
-      FNextPacketID := 1;
+    // ponytail: linear skip; loops forever only with 65535 publishes in flight
+    repeat
+      Result := FNextPacketID;
+      Inc(FNextPacketID);
+      if FNextPacketID = 0 then
+        FNextPacketID := 1;
+    until not FPendingPublish.ContainsKey(Result);
   finally
     FLock.Leave;
   end;
@@ -681,6 +693,8 @@ begin
     Exit;
 
   FShutdown := False;
+  FStopEvent.ResetEvent;
+  FPingSentAt := 0;
   FHost := Host;
   FPort := Port;
   FOptions := Options;
@@ -736,10 +750,6 @@ begin
     // Start keep-alive pinger if needed
     if Options.KeepAliveSec > 0 then
       FPinger := TTask.Run(procedure begin PingerLoop; end);
-
-    if Assigned(FOnConnect) then
-      FOnConnect(TMQTTReasonCode(ReasonCode), SessionPresent);
-
   except
     on E: Exception do
     begin
@@ -750,6 +760,11 @@ begin
       raise;
     end;
   end;
+
+  // Outside the try: the connection is up and the threads are running, so an
+  // exception from user code must not tear the socket down under them.
+  if Assigned(FOnConnect) then
+    FOnConnect(TMQTTReasonCode(ReasonCode), SessionPresent);
 end;
 
 procedure TMQTTClient.Connect(const Host: string; Port: Word; const Options: TMQTTConnectOptions;
@@ -796,40 +811,62 @@ var
   Packet: TBytes;
 begin
   FShutdown := True;
+  FStopEvent.SetEvent;
 
-  if FState = Disconnected then
-    Exit;
-
-  SnapshotLogger.Info('Disconnecting from %s:%d', [FHost, FPort]);
-
-  // Send DISCONNECT packet
-  if FIndy.Connected then
+  // FState may already be Disconnected because the receiver lost the
+  // connection: the threads can still be running, so never exit early here.
+  if FState <> Disconnected then
   begin
-    try
-      Packet := TMQTTProtocol.BuildDisconnect(Ord(FOptions.Version));
-      SendPacket(Packet);
-    except
-      // Ignore send errors during disconnect
+    SnapshotLogger.Info('Disconnecting from %s:%d', [FHost, FPort]);
+    if FIndy.Connected then
+    begin
+      try
+        Packet := TMQTTProtocol.BuildDisconnect(Ord(FOptions.Version));
+        SendPacket(Packet);
+      except
+        // Ignore send errors during disconnect
+      end;
     end;
   end;
 
   FState := Disconnected;
 
-  if FIndy.Connected then
-    FIndy.Disconnect;
+  try
+    if FIndy.Connected then
+      FIndy.Disconnect;
+  except
+    // socket already gone
+  end;
 
-  // Wait for threads to finish
+  // Join the threads before anything they use can be freed (Destroy calls
+  // this). Not when called from a message handler: that IS the receiver,
+  // and it exits on its own once the handler returns and sees FShutdown.
   if Assigned(FPinger) then
   begin
-    FPinger.Wait(2000);
+    try
+      FPinger.Wait;
+    except
+      // task exceptions are already reported through OnError
+    end;
     FPinger := nil;
   end;
 
   if Assigned(FReceiver) then
   begin
-    FReceiver.Wait(2000);
+    if TThread.CurrentThread.ThreadID <> FReceiverThreadID then
+    begin
+      try
+        FReceiver.Wait;
+      except
+        // task exceptions are already reported through OnError
+      end;
+    end;
     FReceiver := nil;
   end;
+
+  // A later plain Connect must not inherit the TLS handler of this session
+  CleanupSSL;
+  FSSLOptions.Enabled := False;
 
   // Clear pending operations
   FLock.Enter;
@@ -872,9 +909,9 @@ begin
   repeat
     Digit := FIndy.IOHandler.ReadByte;
     RL := RL + (Digit and 127) * Multiplier;
-    if Multiplier > 128 * 128 * 128 then
-      raise EMQTTProtocolException.Create('Remaining length too large');
     Multiplier := Multiplier * 128;
+    if ((Digit and 128) <> 0) and (Multiplier > 128 * 128 * 128) then
+      raise EMQTTProtocolException.Create('Remaining length too large');
   until (Digit and 128) = 0;
 
   RLBytes := TMQTTProtocol.EncodeLen(RL);
@@ -887,14 +924,13 @@ begin
     FIndy.IOHandler.ReadBytes(Body, RL);
     Move(Body[0], Result[1 + Length(RLBytes)], RL);
   end;
-
-  FLastActivity := Now;
 end;
 
 procedure TMQTTClient.ReceiverLoop;
 var
   Packet: TBytes;
 begin
+  FReceiverThreadID := TThread.CurrentThread.ThreadID;
   while not FShutdown and (FState in [Connected, Reconnecting]) do
   begin
     try
@@ -922,10 +958,10 @@ begin
       end;
 
     except
-      on E: EIdReadTimeout do
-        Continue;
       on E: EIdConnClosedGracefully do
       begin
+        if FShutdown then
+          Break;
         if FAutoReconnect and not FShutdown then
           DoReconnect
         else
@@ -936,6 +972,8 @@ begin
       end;
       on E: Exception do
       begin
+        if FShutdown then
+          Break; // our own Disconnect closed the socket
         DoError(E.Message);
         if FAutoReconnect and not FShutdown then
           DoReconnect
@@ -949,6 +987,7 @@ begin
   end;
 
   FState := Disconnected;
+  FReceiverThreadID := 0;
 end;
 
 procedure TMQTTClient.PingerLoop;
@@ -960,15 +999,31 @@ begin
 
   while not FShutdown and (FState = Connected) do
   begin
-    Sleep(1000);
+    FStopEvent.WaitFor(1000);
 
     if FShutdown or (FState <> Connected) then
       Break;
 
-    // Check if we need to send a ping
-    if SecondsBetween(Now, FLastActivity) >= KeepAliveInterval then
+    // No PINGRESP within a full keep-alive: the connection is half-open.
+    // Closing the socket makes the receiver run its normal lost-connection path.
+    if (FPingSentAt <> 0) and (SecondsBetween(Now, FPingSentAt) >= FOptions.KeepAliveSec) then
+    begin
+      SnapshotLogger.Warning('No PINGRESP within %d s, closing connection', [FOptions.KeepAliveSec]);
+      FPingSentAt := 0;
+      try
+        FIndy.Disconnect;
+      except
+        // already closed
+      end;
+      Break;
+    end;
+
+    // The client must *send* something within the keep-alive, so only
+    // outbound traffic (SendPacket) refreshes FLastActivity.
+    if (FPingSentAt = 0) and (SecondsBetween(Now, FLastActivity) >= KeepAliveInterval) then
     begin
       try
+        FPingSentAt := Now;
         Packet := TMQTTProtocol.BuildPingReq;
         SendPacket(Packet);
       except
@@ -1017,42 +1072,27 @@ var
   Retain, Dup: Boolean;
   PacketID: Word;
   PendingMsg: TPendingQoS2Inbound;
-  HasManualAck, ShouldAck: Boolean;
 begin
   if not TMQTTProtocol.ParsePublish(Packet, Ord(FOptions.Version), Topic, Payload, QoS, Retain, Dup, PacketID) then
     Exit;
-
-  // Check if any matching subscription uses ManualAck
-  HasManualAck := HasManualAckSubscription(Topic);
 
   case QoS of
     atMostOnce:
       begin
         // No ACK needed for QoS 0
-        if HasManualAck then
-          DispatchMessageManualAck(Topic, Payload, Dup, QoS, 0)
-        else
-          DispatchMessageEx(Topic, Payload, Dup, QoS, 0);
+        DispatchMessageEx(Topic, Payload, Dup, QoS, 0);
+        DispatchMessageManualAck(Topic, Payload, Dup, QoS, 0);
       end;
 
     atLeastOnce:
       begin
-        if HasManualAck then
-        begin
-          // Manual ACK - let handler decide
-          ShouldAck := DispatchMessageManualAck(Topic, Payload, Dup, QoS, PacketID);
-          if ShouldAck then
-            SendAck(QoS, PacketID);
-        end
-        else
-        begin
-          // Auto ACK - dispatch first, then ACK. This preserves the
-          // "at-least-once to application" guarantee: if the process dies
-          // between receive and ACK, the broker redelivers. If we ACK'd
-          // first, a crash mid-dispatch would silently lose the message.
-          DispatchMessageEx(Topic, Payload, Dup, QoS, PacketID);
+        // Dispatch first, then ACK. This preserves the "at-least-once to
+        // application" guarantee: if the process dies between receive and
+        // ACK, the broker redelivers. Manual-ack handlers can veto the ACK
+        // (DispatchMessageManualAck returns True when there are none).
+        DispatchMessageEx(Topic, Payload, Dup, QoS, PacketID);
+        if DispatchMessageManualAck(Topic, Payload, Dup, QoS, PacketID) then
           SendAck(QoS, PacketID);
-        end;
       end;
 
     exactlyOnce:
@@ -1077,24 +1117,38 @@ procedure TMQTTClient.HandlePubAck(const Packet: TBytes);
 var
   PacketID: Word;
   ReasonCode: Byte;
-  Pending: TPendingPublish;
-  Found: Boolean;
 begin
   if not TMQTTProtocol.ParsePubAck(Packet, Ord(FOptions.Version), PacketID, ReasonCode) then
     Exit;
+  CompletePending(PacketID, ReasonCode < $80, Format('PUBACK reason code $%.2x', [ReasonCode]));
+end;
 
+procedure TMQTTClient.CompletePending(PacketID: Word; Success: Boolean; const Why: string);
+var
+  Pending: TPendingPublish;
+begin
   FLock.Enter;
   try
-    Found := FPendingPublish.TryGetValue(PacketID, Pending);
-    if Found then
-      FPendingPublish.Remove(PacketID);
+    if not FPendingPublish.TryGetValue(PacketID, Pending) then
+      Exit;
+    // A PublishSync waiter reads the outcome from whether its entry is
+    // still there, so a failed sync entry stays (psFailed) and the waiter
+    // removes it. Signalling under FLock means the waiter cannot free the
+    // event in between.
+    if Success or not Assigned(Pending.AckEvent) then
+      FPendingPublish.Remove(PacketID)
+    else
+    begin
+      Pending.State := psFailed;
+      FPendingPublish[PacketID] := Pending;
+    end;
+    if Assigned(Pending.AckEvent) then
+      Pending.AckEvent.SetEvent;
   finally
     FLock.Leave;
   end;
-
-  // Signal the specific PublishSync waiter for this packet, if any.
-  if Found and Assigned(Pending.AckEvent) then
-    Pending.AckEvent.SetEvent;
+  if not Success then
+    DoError(Format('Publish failed: PacketID=%d topic="%s" (%s)', [PacketID, Pending.Topic, Why]));
 end;
 
 procedure TMQTTClient.HandlePubRec(const Packet: TBytes);
@@ -1106,6 +1160,13 @@ var
 begin
   if not TMQTTProtocol.ParsePubRec(Packet, Ord(FOptions.Version), PacketID, ReasonCode) then
     Exit;
+
+  // MQTT 5: a PUBREC >= $80 ends the QoS 2 flow, no PUBREL follows
+  if ReasonCode >= $80 then
+  begin
+    CompletePending(PacketID, False, Format('PUBREC reason code $%.2x', [ReasonCode]));
+    Exit;
+  end;
 
   FLock.Enter;
   try
@@ -1129,20 +1190,14 @@ var
   ReasonCode: Byte;
   PendingMsg: TPendingQoS2Inbound;
   CompPacket: TBytes;
-  ShouldDispatch, HasManualAck, ShouldAck: Boolean;
+  ShouldDispatch, ShouldAck: Boolean;
 begin
   if not TMQTTProtocol.ParsePubRel(Packet, Ord(FOptions.Version), PacketID, ReasonCode) then
     Exit;
 
-  // Get stored message under lock
-  ShouldDispatch := False;
   FLock.Enter;
   try
-    if FPendingQoS2Inbound.TryGetValue(PacketID, PendingMsg) then
-    begin
-      FPendingQoS2Inbound.Remove(PacketID);
-      ShouldDispatch := True;
-    end;
+    ShouldDispatch := FPendingQoS2Inbound.TryGetValue(PacketID, PendingMsg);
   finally
     FLock.Leave;
   end;
@@ -1151,16 +1206,20 @@ begin
   ShouldAck := True; // Default: send PUBCOMP
   if ShouldDispatch then
   begin
-    HasManualAck := HasManualAckSubscription(PendingMsg.Topic);
-    if HasManualAck then
-      ShouldAck := DispatchMessageManualAck(PendingMsg.Topic, PendingMsg.Payload, PendingMsg.Dup, exactlyOnce, PacketID)
-    else
-      DispatchMessageEx(PendingMsg.Topic, PendingMsg.Payload, PendingMsg.Dup, exactlyOnce, PacketID);
+    DispatchMessageEx(PendingMsg.Topic, PendingMsg.Payload, PendingMsg.Dup, exactlyOnce, PacketID);
+    ShouldAck := DispatchMessageManualAck(PendingMsg.Topic, PendingMsg.Payload, PendingMsg.Dup, exactlyOnce, PacketID);
   end;
 
-  // Send PUBCOMP only if acknowledged
+  // Send PUBCOMP only if acknowledged. A declined message stays stored so
+  // the PUBREL the broker resends can dispatch it again.
   if ShouldAck then
   begin
+    FLock.Enter;
+    try
+      FPendingQoS2Inbound.Remove(PacketID);
+    finally
+      FLock.Leave;
+    end;
     CompPacket := TMQTTProtocol.BuildPubComp(Ord(FOptions.Version), PacketID);
     SendPacket(CompPacket);
   end;
@@ -1170,23 +1229,10 @@ procedure TMQTTClient.HandlePubComp(const Packet: TBytes);
 var
   PacketID: Word;
   ReasonCode: Byte;
-  Pending: TPendingPublish;
-  Found: Boolean;
 begin
   if not TMQTTProtocol.ParsePubComp(Packet, Ord(FOptions.Version), PacketID, ReasonCode) then
     Exit;
-
-  FLock.Enter;
-  try
-    Found := FPendingPublish.TryGetValue(PacketID, Pending);
-    if Found then
-      FPendingPublish.Remove(PacketID);
-  finally
-    FLock.Leave;
-  end;
-
-  if Found and Assigned(Pending.AckEvent) then
-    Pending.AckEvent.SetEvent;
+  CompletePending(PacketID, ReasonCode < $80, Format('PUBCOMP reason code $%.2x', [ReasonCode]));
 end;
 
 procedure TMQTTClient.HandleSubAck(const Packet: TBytes);
@@ -1231,8 +1277,7 @@ end;
 
 procedure TMQTTClient.HandlePingResp;
 begin
-  // Ping response received, connection is alive
-  FLastActivity := Now;
+  FPingSentAt := 0;
 end;
 
 procedure TMQTTClient.HandleDisconnect(const Packet: TBytes);
@@ -1280,42 +1325,23 @@ begin
 
   FLock.Enter;
   try
-    // First try exact match
-    if FSubscriptions.TryGetValue(Topic, SubInfo) then
+    // Every matching filter gets the message: "a/b" and "a/#" both fire.
+    for Filter in FSubscriptions.Keys do
     begin
-      case SubInfo.HandlerType of
-        htSimple:
-          begin
-            SetLength(SimpleHandlers, 1);
-            SimpleHandlers[0] := SubInfo.Handler;
-          end;
-        htExtended:
-          begin
-            SetLength(ExtendedHandlers, 1);
-            ExtendedHandlers[0] := SubInfo.ExtendedHandler;
-          end;
-      end;
-    end
-    else
-    begin
-      // Try wildcard matching
-      for Filter in FSubscriptions.Keys do
+      if TMQTTProtocol.TopicMatchesFilter(Topic, Filter) then
       begin
-        if TMQTTProtocol.TopicMatchesFilter(Topic, Filter) then
-        begin
-          SubInfo := FSubscriptions[Filter];
-          case SubInfo.HandlerType of
-            htSimple:
-              begin
-                SetLength(SimpleHandlers, Length(SimpleHandlers) + 1);
-                SimpleHandlers[High(SimpleHandlers)] := SubInfo.Handler;
-              end;
-            htExtended:
-              begin
-                SetLength(ExtendedHandlers, Length(ExtendedHandlers) + 1);
-                ExtendedHandlers[High(ExtendedHandlers)] := SubInfo.ExtendedHandler;
-              end;
-          end;
+        SubInfo := FSubscriptions[Filter];
+        case SubInfo.HandlerType of
+          htSimple:
+            begin
+              SetLength(SimpleHandlers, Length(SimpleHandlers) + 1);
+              SimpleHandlers[High(SimpleHandlers)] := SubInfo.Handler;
+            end;
+          htExtended:
+            begin
+              SetLength(ExtendedHandlers, Length(ExtendedHandlers) + 1);
+              ExtendedHandlers[High(ExtendedHandlers)] := SubInfo.ExtendedHandler;
+            end;
         end;
       end;
     end;
@@ -1359,28 +1385,15 @@ begin
 
   FLock.Enter;
   try
-    // First try exact match
-    if FSubscriptions.TryGetValue(Topic, SubInfo) then
+    for Filter in FSubscriptions.Keys do
     begin
-      if SubInfo.HandlerType = htManualAck then
+      if TMQTTProtocol.TopicMatchesFilter(Topic, Filter) then
       begin
-        SetLength(ManualHandlers, 1);
-        ManualHandlers[0] := SubInfo.ManualAckHandler;
-      end;
-    end
-    else
-    begin
-      // Try wildcard matching
-      for Filter in FSubscriptions.Keys do
-      begin
-        if TMQTTProtocol.TopicMatchesFilter(Topic, Filter) then
+        SubInfo := FSubscriptions[Filter];
+        if SubInfo.HandlerType = htManualAck then
         begin
-          SubInfo := FSubscriptions[Filter];
-          if SubInfo.HandlerType = htManualAck then
-          begin
-            SetLength(ManualHandlers, Length(ManualHandlers) + 1);
-            ManualHandlers[High(ManualHandlers)] := SubInfo.ManualAckHandler;
-          end;
+          SetLength(ManualHandlers, Length(ManualHandlers) + 1);
+          ManualHandlers[High(ManualHandlers)] := SubInfo.ManualAckHandler;
         end;
       end;
     end;
@@ -1401,37 +1414,6 @@ begin
       // Exception = don't acknowledge (will be redelivered)
       Result := False;
     end;
-  end;
-end;
-
-function TMQTTClient.HasManualAckSubscription(const Topic: string): Boolean;
-var
-  SubInfo: TSubscriptionInfo;
-  Filter: string;
-begin
-  Result := False;
-
-  FLock.Enter;
-  try
-    // Check exact match
-    if FSubscriptions.TryGetValue(Topic, SubInfo) then
-    begin
-      if SubInfo.HandlerType = htManualAck then
-        Exit(True);
-    end;
-
-    // Check wildcard matches
-    for Filter in FSubscriptions.Keys do
-    begin
-      if TMQTTProtocol.TopicMatchesFilter(Topic, Filter) then
-      begin
-        SubInfo := FSubscriptions[Filter];
-        if SubInfo.HandlerType = htManualAck then
-          Exit(True);
-      end;
-    end;
-  finally
-    FLock.Leave;
   end;
 end;
 
@@ -1499,26 +1481,35 @@ begin
 
     SnapshotLogger.Info('Reconnect attempt in %d ms (base=%d, jitter=%d%%)',
       [EffectiveDelay, BaseDelay, JitterPct]);
-    Sleep(EffectiveDelay);
+    FStopEvent.WaitFor(EffectiveDelay); // Disconnect wakes us immediately
 
     if FShutdown then
       Break;
 
     try
-      if FIndy.Connected then
-        FIndy.Disconnect;
+      // Hold the write lock while the socket and TLS handler are swapped, so
+      // a publisher that is already inside SendPacket cannot write to a freed
+      // handler or ahead of CONNECT. The lock is re-entrant.
+      var Packet: TBytes;
+      FWriteLock.Enter;
+      try
+        if FIndy.Connected then
+          FIndy.Disconnect;
 
-      // Reconfigure SSL if enabled
-      if FSSLOptions.Enabled then
-        ConfigureSSL;
+        // Reconfigure SSL if enabled
+        if FSSLOptions.Enabled then
+          ConfigureSSL;
 
-      FIndy.Host := FHost;
-      FIndy.Port := FPort;
-      FIndy.Connect;
+        FIndy.Host := FHost;
+        FIndy.Port := FPort;
+        FIndy.Connect;
 
-      // Re-send CONNECT
-      var Packet := TMQTTProtocol.BuildConnect(FOptions);
-      SendPacket(Packet);
+        // Re-send CONNECT
+        Packet := TMQTTProtocol.BuildConnect(FOptions);
+        SendPacket(Packet);
+      finally
+        FWriteLock.Leave;
+      end;
 
       FIndy.IOHandler.CheckForDataOnSource(5000);
       if not FIndy.IOHandler.InputBufferIsEmpty then
@@ -1531,6 +1522,7 @@ begin
         begin
           FState := Connected;
           FLastActivity := Now;
+          FPingSentAt := 0;
           FLastSessionPresent := SessionPresent;
           SnapshotLogger.Info('Reconnected to %s:%d (SessionPresent=%s)',
             [FHost, FPort, BoolToStr(SessionPresent, True)]);
@@ -1648,7 +1640,7 @@ begin
     try
       for Pair in FPendingPublish do
       begin
-        if SecondsBetween(Now, Pair.Value.Timestamp) > 5 then
+        if (Pair.Value.State <> psFailed) and (SecondsBetween(Now, Pair.Value.Timestamp) > 5) then
           ToRetry.Add(Pair.Value);
       end;
     finally
@@ -1659,22 +1651,21 @@ begin
     begin
       if Pending.RetryCount >= 3 then
       begin
-        FLock.Enter;
-        try
-          FPendingPublish.Remove(Pending.PacketID);
-        finally
-          FLock.Leave;
-        end;
         SnapshotLogger.Warning(
           'Pending publish dropped after 3 retries: PacketID=%d topic="%s" qos=%d',
           [Pending.PacketID, Pending.Topic, Ord(Pending.QoS)]);
-        DoError(Format('Publish dropped after retries: PacketID=%d topic="%s"',
-          [Pending.PacketID, Pending.Topic]));
-        // Wake any PublishSync caller waiting on this entry so it returns
-        // False instead of timing out after a long wait.
-        if Assigned(Pending.AckEvent) then
-          Pending.AckEvent.SetEvent;
+        // Also wakes a PublishSync caller so it returns False right away
+        CompletePending(Pending.PacketID, False, 'no ACK after 3 retries');
         Continue;
+      end;
+
+      // The ACK may have arrived since the snapshot: don't resend a DUP then
+      FLock.Enter;
+      try
+        if not FPendingPublish.ContainsKey(Pending.PacketID) then
+          Continue;
+      finally
+        FLock.Leave;
       end;
 
       case Pending.State of
@@ -1732,9 +1723,9 @@ begin
     PacketID := GetNextPacketID;
 
   Packet := TMQTTProtocol.BuildPublish(Ord(FOptions.Version), Topic, Payload, QoS, Retain, False, PacketID);
-  SendPacket(Packet);
 
-  // Store for QoS 1/2
+  // Store for QoS 1/2 BEFORE sending: on a fast broker the ACK can be
+  // processed by the receiver before an Add placed after SendPacket.
   if QoS > atMostOnce then
   begin
     Pending.PacketID := PacketID;
@@ -1754,6 +1745,21 @@ begin
       FLock.Leave;
     end;
   end;
+
+  try
+    SendPacket(Packet);
+  except
+    if QoS > atMostOnce then
+    begin
+      FLock.Enter;
+      try
+        FPendingPublish.Remove(PacketID);
+      finally
+        FLock.Leave;
+      end;
+    end;
+    raise;
+  end;
 end;
 
 function TMQTTClient.PublishSync(const Topic: string; const Payload: TBytes; QoS: TMQTTQoS;
@@ -1762,13 +1768,13 @@ var
   PacketID: Word;
   Packet: TBytes;
   Pending: TPendingPublish;
-  WaitRes: TWaitResult;
   PerCallEvent: TEvent;
 begin
-  Result := False;
-
   if not IsConnected then
     raise EMQTTException.Create('Not connected');
+
+  if not TMQTTProtocol.IsValidTopicName(Topic) then
+    raise EMQTTException.Create('Invalid topic name');
 
   if QoS = atMostOnce then
   begin
@@ -1776,6 +1782,11 @@ begin
     Result := True;
     Exit;
   end;
+
+  // Handlers run on the receiver thread, the only one that can process the
+  // ACK we would be waiting for: waiting there always times out.
+  if TThread.CurrentThread.ThreadID = FReceiverThreadID then
+    raise EMQTTException.Create('PublishSync cannot be called from a message handler; use Publish');
 
   PacketID := GetNextPacketID;
   Packet := TMQTTProtocol.BuildPublish(Ord(FOptions.Version), Topic, Payload, QoS, Retain, False, PacketID);
@@ -1802,31 +1813,21 @@ begin
       FLock.Leave;
     end;
 
-    SendPacket(Packet);
-
-    WaitRes := PerCallEvent.WaitFor(TimeoutMs);
-
-    FLock.Enter;
     try
-      // Whether we timed out or got signaled, scrub the pending entry so
-      // a late ACK can't reference a freed event.
-      if FPendingPublish.ContainsKey(PacketID) then
-      begin
-        var Stale: TPendingPublish;
-        if FPendingPublish.TryGetValue(PacketID, Stale) then
-          Stale.AckEvent := nil; // detach before removing
-        FPendingPublish.Remove(PacketID);
-      end
-      else
-        Result := True; // ACK already removed it
+      SendPacket(Packet);
+      PerCallEvent.WaitFor(TimeoutMs);
     finally
-      FLock.Leave;
+      // Success removed the entry; timeout or failure left it (see
+      // CompletePending). Removing it under FLock guarantees nobody can
+      // signal the event after it is freed below.
+      FLock.Enter;
+      try
+        Result := not FPendingPublish.ContainsKey(PacketID);
+        FPendingPublish.Remove(PacketID);
+      finally
+        FLock.Leave;
+      end;
     end;
-
-    // WaitRes wrSignaled may race with the "already removed" branch above;
-    // either is OK - both mean we got the ACK.
-    if WaitRes = wrSignaled then
-      Result := True;
   finally
     PerCallEvent.Free;
   end;

@@ -8,6 +8,7 @@ uses
   System.Classes,
   System.SyncObjs,
   System.Generics.Collections,
+  System.DateUtils,
   IdTCPClient,
   MQTT.Types,
   MQTT.Protocol,
@@ -76,6 +77,12 @@ type
     procedure ReconnectMaxDelayMs_Rejects_NonPositive;
     [Test]
     procedure ReconnectJitterPercent_Rejects_OutOfRange;
+    [Test]
+    procedure Subscribe_ExactAndWildcard_BothFire;
+    [Test]
+    procedure PublishSync_FromHandler_Raises;
+    [Test]
+    procedure Disconnect_IsPrompt;
   end;
 
 implementation
@@ -869,6 +876,103 @@ begin
       Client.ReconnectJitterPercent := 101;
     end,
     EMQTTException);
+end;
+
+procedure TMQTTClientTests.Subscribe_ExactAndWildcard_BothFire;
+var
+  Sub, Pub: IMQTTClient;
+  ExactEvent, WildEvent: TEvent;
+  BaseTopic: string;
+begin
+  RequireBroker;
+  BaseTopic := 'dunit/overlap/' + IntToStr(Random(1000000));
+  ExactEvent := TEvent.Create(nil, True, False, '');
+  WildEvent := TEvent.Create(nil, True, False, '');
+  try
+    Sub := CreateMQTTClient;
+    Pub := CreateMQTTClient;
+    Sub.Connect(FBrokerHost, FBrokerPort, MakeOptions(NewClientID));
+    Pub.Connect(FBrokerHost, FBrokerPort, MakeOptions(NewClientID));
+    try
+      Sub.Subscribe(BaseTopic + '/x',
+        procedure(const T: string; const P: TBytes)
+        begin
+          ExactEvent.SetEvent;
+        end,
+        atLeastOnce);
+      Sub.Subscribe(BaseTopic + '/#',
+        procedure(const T: string; const P: TBytes)
+        begin
+          WildEvent.SetEvent;
+        end,
+        atLeastOnce);
+      Sleep(500);
+      Pub.PublishSync(BaseTopic + '/x', TEncoding.UTF8.GetBytes('1'), atLeastOnce, False, 2000);
+      Assert.AreEqual(wrSignaled, ExactEvent.WaitFor(WAIT_MS_LONG), 'exact handler not called');
+      Assert.AreEqual(wrSignaled, WildEvent.WaitFor(WAIT_MS_LONG), 'wildcard handler not called');
+    finally
+      Pub.Disconnect;
+      Sub.Disconnect;
+    end;
+  finally
+    WildEvent.Free;
+    ExactEvent.Free;
+  end;
+end;
+
+procedure TMQTTClientTests.PublishSync_FromHandler_Raises;
+var
+  Client: IMQTTClient;
+  GotEvent: TEvent;
+  Topic, RaisedClass: string;
+begin
+  RequireBroker;
+  Topic := 'dunit/syncinhandler/' + IntToStr(Random(1000000));
+  GotEvent := TEvent.Create(nil, True, False, '');
+  try
+    Client := CreateMQTTClient;
+    Client.Connect(FBrokerHost, FBrokerPort, MakeOptions(NewClientID));
+    try
+      Client.Subscribe(Topic,
+        procedure(const T: string; const P: TBytes)
+        begin
+          try
+            Client.PublishSync(Topic + '/reply', P, atLeastOnce, False, 2000);
+            RaisedClass := '';
+          except
+            on E: Exception do
+              RaisedClass := E.ClassName;
+          end;
+          GotEvent.SetEvent;
+        end,
+        atMostOnce);
+      Sleep(500);
+      Client.Publish(Topic, 'ping', atMostOnce);
+      Assert.AreEqual(wrSignaled, GotEvent.WaitFor(WAIT_MS_LONG), 'handler not called');
+      Assert.AreEqual('EMQTTException', RaisedClass);
+    finally
+      Client.Unsubscribe(Topic); // the handler captures Client: break the cycle
+      Client.Disconnect;
+    end;
+  finally
+    GotEvent.Free;
+  end;
+end;
+
+procedure TMQTTClientTests.Disconnect_IsPrompt;
+var
+  Client: IMQTTClient;
+  Started: TDateTime;
+begin
+  RequireBroker;
+  Client := CreateMQTTClient;
+  Client.Connect(FBrokerHost, FBrokerPort, MakeOptions(NewClientID));
+  Sleep(200);
+  Started := Now;
+  Client.Disconnect;
+  // Joins receiver and pinger; the pinger used to sleep in 1 s slices
+  Assert.IsTrue(MilliSecondsBetween(Now, Started) < 500,
+    Format('Disconnect took %d ms', [MilliSecondsBetween(Now, Started)]));
 end;
 
 initialization

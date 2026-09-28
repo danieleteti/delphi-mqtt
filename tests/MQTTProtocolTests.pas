@@ -86,6 +86,25 @@ type
     procedure GetPacketType_Publish;
     [Test]
     procedure GetPacketType_PingReq;
+
+    [Test]
+    procedure GetPacketID_Publish_LongTopic;
+    [Test]
+    procedure TopicMatchesFilter_DollarTopics_NotMatchedByLeadingWildcard;
+    [Test]
+    procedure TopicMatchesFilter_SharedSubscription;
+    [Test]
+    procedure IsValidTopicFilter_SharedSubscription;
+    [Test]
+    procedure EncodeStr_Over64K_Raises;
+    [Test]
+    procedure EncodeLen_OutOfRange_Raises;
+    [Test]
+    procedure ParsePublish_5_PropsLengthPastEnd_ReturnsFalse;
+    [Test]
+    procedure ParsePublish_QoS3_ReturnsFalse;
+    [Test]
+    procedure ParseSubAck_5_PropsLengthPastEnd_ReturnsFalse;
   end;
 
 implementation
@@ -411,6 +430,94 @@ var
 begin
   Packet := TMQTTProtocol.BuildPingReq;
   Assert.AreEqual(Ord(ptPingReq), Ord(TMQTTProtocol.GetPacketType(Packet)));
+end;
+
+procedure TMQTTProtocolTests.GetPacketID_Publish_LongTopic;
+var
+  Packet: TBytes;
+begin
+  // topic length 5: the old precedence bug computed (4 or 5) = 5 instead of 9
+  Packet := TMQTTProtocol.BuildPublish(4, 'abcde', TEncoding.UTF8.GetBytes('x'),
+    atLeastOnce, False, False, $1234);
+  Assert.AreEqual<Word>($1234, TMQTTProtocol.GetPacketID(Packet));
+end;
+
+procedure TMQTTProtocolTests.TopicMatchesFilter_DollarTopics_NotMatchedByLeadingWildcard;
+begin
+  Assert.IsFalse(TMQTTProtocol.TopicMatchesFilter('$SYS/broker/load', '#'));
+  Assert.IsFalse(TMQTTProtocol.TopicMatchesFilter('$SYS/load', '+/load'));
+  Assert.IsTrue(TMQTTProtocol.TopicMatchesFilter('$SYS/broker/load', '$SYS/#'));
+end;
+
+procedure TMQTTProtocolTests.TopicMatchesFilter_SharedSubscription;
+begin
+  Assert.IsTrue(TMQTTProtocol.TopicMatchesFilter('a/b', '$share/g1/a/b'));
+  Assert.IsTrue(TMQTTProtocol.TopicMatchesFilter('a/b/c', '$share/g1/a/#'));
+  Assert.IsFalse(TMQTTProtocol.TopicMatchesFilter('x/y', '$share/g1/a/#'));
+end;
+
+procedure TMQTTProtocolTests.IsValidTopicFilter_SharedSubscription;
+begin
+  Assert.IsTrue(TMQTTProtocol.IsValidTopicFilter('$share/g1/a/+'));
+  Assert.IsFalse(TMQTTProtocol.IsValidTopicFilter('$share/+/a'), 'wildcard group');
+  Assert.IsFalse(TMQTTProtocol.IsValidTopicFilter('$share//a'), 'empty group');
+  Assert.IsFalse(TMQTTProtocol.IsValidTopicFilter('$share/g1'), 'no filter');
+end;
+
+procedure TMQTTProtocolTests.EncodeStr_Over64K_Raises;
+begin
+  Assert.WillRaise(
+    procedure
+    begin
+      TMQTTProtocol.EncodeStr(StringOfChar('a', 65536));
+    end,
+    EMQTTProtocolException);
+  Assert.AreEqual<NativeInt>(65537, Length(TMQTTProtocol.EncodeStr(StringOfChar('a', 65535))));
+end;
+
+procedure TMQTTProtocolTests.EncodeLen_OutOfRange_Raises;
+begin
+  Assert.WillRaise(
+    procedure
+    begin
+      TMQTTProtocol.EncodeLen(268435456);
+    end,
+    EMQTTProtocolException);
+end;
+
+procedure TMQTTProtocolTests.ParsePublish_5_PropsLengthPastEnd_ReturnsFalse;
+var
+  Topic: string;
+  Payload: TBytes;
+  QoS: TMQTTQoS;
+  Retain, Dup: Boolean;
+  PacketID: Word;
+begin
+  // topic "a", property length $7F but only 2 bytes left in the packet
+  Assert.IsFalse(TMQTTProtocol.ParsePublish(
+    TBytes.Create($30, 6, 0, 1, Ord('a'), $7F, Ord('x'), Ord('y')),
+    5, Topic, Payload, QoS, Retain, Dup, PacketID));
+end;
+
+procedure TMQTTProtocolTests.ParsePublish_QoS3_ReturnsFalse;
+var
+  Topic: string;
+  Payload: TBytes;
+  QoS: TMQTTQoS;
+  Retain, Dup: Boolean;
+  PacketID: Word;
+begin
+  Assert.IsFalse(TMQTTProtocol.ParsePublish(
+    TBytes.Create($36, 5, 0, 1, Ord('a'), 0, 1),
+    4, Topic, Payload, QoS, Retain, Dup, PacketID));
+end;
+
+procedure TMQTTProtocolTests.ParseSubAck_5_PropsLengthPastEnd_ReturnsFalse;
+var
+  PacketID: Word;
+  Codes: TArray<Byte>;
+begin
+  Assert.IsFalse(TMQTTProtocol.ParseSubAck(TBytes.Create($90, 4, 0, 1, $7F, 0), 5, PacketID, Codes));
 end;
 
 initialization

@@ -67,6 +67,8 @@ class function TMQTTProtocol.EncodeLen(Value: Integer): TBytes;
 var
   Digit: Byte;
 begin
+  if (Value < 0) or (Value > 268435455) then
+    raise EMQTTProtocolException.CreateFmt('Remaining length out of range: %d', [Value]);
   SetLength(Result, 0);
   repeat
     Digit := Value mod 128;
@@ -89,9 +91,9 @@ begin
     if Stream.Read(Digit, 1) <> 1 then
       raise EMQTTProtocolException.Create('Unexpected end of stream decoding length');
     Result := Result + (Digit and 127) * Multiplier;
-    if Multiplier > 128 * 128 * 128 then
-      raise EMQTTProtocolException.Create('Malformed remaining length');
     Multiplier := Multiplier * 128;
+    if ((Digit and 128) <> 0) and (Multiplier > 128 * 128 * 128) then
+      raise EMQTTProtocolException.Create('Malformed remaining length');
   until (Digit and 128) = 0;
 end;
 
@@ -108,9 +110,9 @@ begin
     Digit := Data[Offset];
     Inc(Offset);
     Result := Result + (Digit and 127) * Multiplier;
-    if Multiplier > 128 * 128 * 128 then
-      raise EMQTTProtocolException.Create('Malformed remaining length');
     Multiplier := Multiplier * 128;
+    if ((Digit and 128) <> 0) and (Multiplier > 128 * 128 * 128) then
+      raise EMQTTProtocolException.Create('Malformed remaining length');
   until (Digit and 128) = 0;
 end;
 
@@ -120,6 +122,8 @@ var
   L: Word;
 begin
   B := TEncoding.UTF8.GetBytes(S);
+  if Length(B) > $FFFF then
+    raise EMQTTProtocolException.Create('String too long for MQTT (max 65535 bytes)');
   L := Length(B);
   SetLength(Result, L + 2);
   Result[0] := Hi(L);
@@ -168,6 +172,8 @@ class function TMQTTProtocol.EncodeBinary(const Data: TBytes): TBytes;
 var
   L: Word;
 begin
+  if Length(Data) > $FFFF then
+    raise EMQTTProtocolException.Create('Binary data too long for MQTT (max 65535 bytes)');
   L := Length(Data);
   SetLength(Result, L + 2);
   Result[0] := Hi(L);
@@ -218,7 +224,7 @@ begin
   Version := Ord(Options.Version);
   ClientID := Options.ClientID;
   if ClientID = '' then
-    ClientID := 'DelphiMQTT_' + IntToStr(Random(100000));
+    ClientID := 'DelphiMQTT_' + Copy(TGUID.NewGuid.ToString.Replace('-', ''), 2, 12);
 
   // Variable Header
   VH := EncodeStr('MQTT');
@@ -526,6 +532,8 @@ begin
     Exit;
 
   Header := Packet[0];
+  if (Header and $06) = $06 then
+    Exit; // QoS 3 is malformed
   Dup := (Header and $08) <> 0;
   QoS := TMQTTQoS((Header and $06) shr 1);
   Retain := (Header and $01) <> 0;
@@ -542,7 +550,7 @@ begin
   PacketID := 0;
   if QoS > atMostOnce then
   begin
-    if Offset + 2 > Length(Packet) then
+    if Offset + 2 > PayloadStart then
       Exit;
     PacketID := (Packet[Offset] shl 8) or Packet[Offset + 1];
     Inc(Offset, 2);
@@ -554,6 +562,8 @@ begin
     PropsLen := DecodeLen(Packet, Offset);
     Inc(Offset, PropsLen); // Skip properties for now
   end;
+  if Offset > PayloadStart then
+    Exit;
 
   // Payload
   SetLength(Payload, PayloadStart - Offset);
@@ -587,6 +597,8 @@ begin
     PropsLen := DecodeLen(Packet, Offset);
     Inc(Offset, PropsLen);
   end;
+  if Offset > Length(Packet) then
+    Exit;
 
   // Reason Codes
   SetLength(ReasonCodes, Length(Packet) - Offset);
@@ -620,6 +632,8 @@ begin
     PropsLen := DecodeLen(Packet, Offset);
     Inc(Offset, PropsLen);
   end;
+  if Offset > Length(Packet) then
+    Exit;
 
   // Reason Codes
   SetLength(ReasonCodes, Length(Packet) - Offset);
@@ -737,14 +751,30 @@ class function TMQTTProtocol.TopicMatchesFilter(const Topic, Filter: string): Bo
 var
   TopicParts, FilterParts: TArray<string>;
   I: Integer;
+  EffectiveFilter: string;
 begin
+  // Shared subscription: messages arrive on the plain topic, so match
+  // against the filter without the "$share/<group>/" prefix.
+  EffectiveFilter := Filter;
+  if EffectiveFilter.StartsWith('$share/') then
+  begin
+    I := EffectiveFilter.IndexOf('/', 7);
+    if I < 0 then
+      Exit(False);
+    EffectiveFilter := EffectiveFilter.Substring(I + 1);
+  end;
+
   // Exact match
-  if Topic = Filter then
+  if Topic = EffectiveFilter then
     Exit(True);
+
+  // [MQTT-4.7.2-1] wildcards at the first level never match $-topics ($SYS...)
+  if Topic.StartsWith('$') and (EffectiveFilter.StartsWith('#') or EffectiveFilter.StartsWith('+')) then
+    Exit(False);
 
   // Split into parts
   TopicParts := Topic.Split(['/']);
-  FilterParts := Filter.Split(['/']);
+  FilterParts := EffectiveFilter.Split(['/']);
 
   I := 0;
   while (I < Length(FilterParts)) do
@@ -784,6 +814,15 @@ begin
     Exit(False);
 
   Parts := Filter.Split(['/']);
+
+  // $share/<group>/<filter>: group non-empty and wildcard-free, filter required
+  if (Length(Parts) > 0) and (Parts[0] = '$share') then
+  begin
+    if (Length(Parts) < 3) or (Parts[1] = '') or
+       (Pos('+', Parts[1]) > 0) or (Pos('#', Parts[1]) > 0) then
+      Exit(False);
+    Exit(IsValidTopicFilter(Filter.Substring(Length('$share/') + Length(Parts[1]) + 1)));
+  end;
 
   for I := 0 to High(Parts) do
   begin
@@ -854,7 +893,7 @@ begin
         // Skip topic
         if Offset + 2 > Length(Packet) then
           Exit;
-        Offset := Offset + 2 + (Packet[Offset] shl 8) or Packet[Offset + 1];
+        Offset := Offset + 2 + ((Packet[Offset] shl 8) or Packet[Offset + 1]);
         // QoS > 0 has packet ID
         if ((Packet[0] and $06) <> 0) and (Offset + 2 <= Length(Packet)) then
           Result := (Packet[Offset] shl 8) or Packet[Offset + 1];
